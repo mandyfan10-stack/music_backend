@@ -6,10 +6,11 @@ import httpx
 from bs4 import BeautifulSoup
 from groq import Groq
 import json
+import re
 
 app = FastAPI()
 
-# Разрешаем запросы с фронтенда (Telegram Web App)
+# Разрешаем запросы с фронтенда
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,69 +25,73 @@ client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 class LinkRequest(BaseModel):
     link: str
 
-async def fetch_page_title(url: str) -> str:
-    """Асинхронно получает заголовок страницы (title) по URL"""
+async def get_metadata_from_page(url: str):
+    """Скрапинг страницы для получения заголовка и обложки"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+    }
     try:
-        # Притворяемся браузером, чтобы избежать блокировок от Spotify/YouTube
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        async with httpx.AsyncClient(follow_redirects=True) as http_client:
-            response = await http_client.get(url, headers=headers, timeout=5.0)
+        async with httpx.AsyncClient(follow_redirects=True, headers=headers) as h_client:
+            response = await h_client.get(url, timeout=10.0)
             soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Ищем заголовок
             title = soup.title.string if soup.title else ""
-            return title.strip()
+            
+            # Ищем обложку (OpenGraph теги)
+            image = ""
+            og_image = soup.find("meta", property="og:image")
+            if og_image:
+                image = og_image["content"]
+            
+            return title.strip(), image
     except Exception as e:
-        print(f"Error fetching page title: {e}")
-        return ""
+        print(f"Scraping error: {e}")
+        return "", ""
 
 @app.post("/api/parse_link")
-async def parse_link_endpoint(req: LinkRequest):
+async def parse_link(req: LinkRequest):
     if not client:
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY не настроен на сервере.")
+        raise HTTPException(status_code=500, detail="Сервер не настроен (API KEY).")
     
-    url = req.link.lower()
+    url = req.link
     
-    # 1. Жесткая проверка: только YouTube и Spotify
-    if not ("youtube.com" in url or "youtu.be" in url or "spotify.com" in url):
-        raise HTTPException(status_code=400, detail="Разрешены ссылки только с YouTube и Spotify.")
+    # Получаем сырые данные со страницы
+    raw_title, found_image = await get_metadata_from_page(url)
     
-    # 2. Получаем заголовок страницы по ссылке
-    page_title = await fetch_page_title(req.link)
-    
-    if not page_title:
-        # Если не смогли получить title, попробуем передать просто ссылку
-        page_title = f"URL: {req.link}"
+    if not raw_title:
+        raw_title = f"Ссылка: {url}"
 
     try:
-        # 3. Отправляем LLaMA задачу вычленить артиста и название
+        # Просим LLaMA очистить название
         system_prompt = """
-        Ты - строгий музыкальный парсер. Тебе дают заголовок веб-страницы (YouTube или Spotify).
-        Твоя задача извлечь имя артиста и название трека/альбома.
-        Убери лишние слова вроде "YouTube", "Spotify", "Official Video", "Lyrics" и т.д.
-        Верни СТРОГО валидный JSON формат, без какого-либо дополнительного текста, markdown или пояснений.
-        Формат: {"artist": "Имя", "name": "Название"}
-        Если не можешь определить, верни {"artist": "Аноним", "name": "Неизвестный релиз"}.
+        Ты - музыкальный парсер. Твоя цель: извлечь АРТИСТА и НАЗВАНИЕ трека/альбома из текста.
+        Убери мусор: 'Яндекс Музыка', 'YouTube', 'Слушать онлайн', 'Official Video', 'Lyrics'.
+        Верни ТОЛЬКО JSON: {"artist": "...", "name": "..."}.
+        Если не нашел, используй "Артист" и "Трек".
         """
         
-        response = client.chat.completions.create(
+        chat_completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Страница: {page_title}"}
+                {"role": "user", "content": f"Текст для анализа: {raw_title}"}
             ],
             temperature=0.1,
-            max_tokens=200,
+            response_format={"type": "json_object"}
         )
         
-        ai_text = response.choices[0].message.content.strip()
+        result = json.loads(chat_completion.choices[0].message.content)
         
-        # Очистка возможных markdown артефактов
-        ai_text = ai_text.replace('```json', '').replace('```', '').strip()
-        
-        parsed_data = json.loads(ai_text)
-        return parsed_data
+        # Если обложка не найдена скрапером, возвращаем пустую строку (фронтенд сам найдет в iTunes)
+        result["img"] = found_image
+        return result
         
     except Exception as e:
-        print(f"LLaMA Error: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка обработки нейросетью.")
+        print(f"AI Error: {e}")
+        return {"artist": "Артист", "name": "Релиз", "img": found_image}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
