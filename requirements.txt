@@ -1,6 +1,8 @@
 fastapi
 uvicorn
-groq
-pydantic
 httpx
 beautifulsoup4
+groq
+pydantic
+motor
+dnspython
