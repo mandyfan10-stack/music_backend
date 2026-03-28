@@ -6,11 +6,10 @@ import httpx
 from bs4 import BeautifulSoup
 from groq import Groq
 import json
-import sqlite3
+from motor.motor_asyncio import AsyncIOMotorClient
 
 app = FastAPI()
 
-# Разрешаем запросы с фронтенда
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,32 +18,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- НАСТРОЙКИ MONGODB ---
+# Твоя ссылка (без угловых скобок!)
+MONGO_URL = "mongodb+srv://mandyfan10_db_user:sergejkopo@cluster0.xixqzud.mongodb.net/?appName=Cluster0"
+client_db = AsyncIOMotorClient(MONGO_URL)
+db = client_db["raper_xxii_database"]
+
+# Коллекции (Таблицы)
+releases_col = db["releases"]
+reviews_col = db["reviews"]
+likes_col = db["likes"]
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+client_ai = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-DB_FILE = "database.db"
-
-# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ SQLite ---
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    # Таблица релизов
-    c.execute('''CREATE TABLE IF NOT EXISTS releases (id TEXT PRIMARY KEY, name TEXT, artist TEXT, img TEXT, link TEXT)''')
-    # Таблица рецензий
-    c.execute('''CREATE TABLE IF NOT EXISTS reviews (id TEXT PRIMARY KEY, relId TEXT, author TEXT, text TEXT, rating INTEGER, date TEXT)''')
-    # Таблица лайков
-    c.execute('''CREATE TABLE IF NOT EXISTS likes (releaseId TEXT, username TEXT, PRIMARY KEY(releaseId, username))''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-# --- МОДЕЛИ ДАННЫХ (Pydantic) ---
+# --- МОДЕЛИ ---
 class LinkRequest(BaseModel):
     link: str
 
@@ -54,6 +42,7 @@ class Release(BaseModel):
     artist: str
     img: str
     link: str
+    timestamp: float
 
 class Review(BaseModel):
     id: str
@@ -62,130 +51,94 @@ class Review(BaseModel):
     text: str
     rating: int
     date: str
+    timestamp: float
 
 class LikeReq(BaseModel):
     releaseId: str
     username: str
     isLike: bool
 
-# --- API ЭНДПОИНТЫ ДЛЯ РАБОТЫ С БД ---
+# --- API ЭНДПОИНТЫ ДЛЯ РАБОТЫ С MONGODB ---
 
 @app.get("/api/data")
-def get_all_data(username: str = ""):
-    """Возвращает всё содержимое базы при запуске приложения"""
-    conn = get_db()
-    c = conn.cursor()
+async def get_all_data(username: str = ""):
+    """Получение всех релизов, отзывов и лайков при входе"""
+    releases = await releases_col.find().sort("timestamp", -1).to_list(length=100)
+    reviews = await reviews_col.find().sort("timestamp", -1).to_list(length=500)
     
-    c.execute("SELECT * FROM releases ORDER BY id DESC")
-    releases = [dict(row) for row in c.fetchall()]
+    # Убираем техническое поле _id от MongoDB, чтобы сайт не выдал ошибку
+    for r in releases: r.pop("_id", None)
+    for r in reviews: r.pop("_id", None)
     
-    c.execute("SELECT * FROM reviews ORDER BY id DESC")
-    reviews = [dict(row) for row in c.fetchall()]
-    
-    likes = []
+    user_likes = []
     if username:
-        c.execute("SELECT releaseId FROM likes WHERE username=?", (username,))
-        likes = [row["releaseId"] for row in c.fetchall()]
+        likes = await likes_col.find({"username": username}).to_list(length=1000)
+        user_likes = [l["releaseId"] for l in likes]
         
-    conn.close()
-    return {"releases": releases, "reviews": reviews, "likes": likes}
+    return {"releases": releases, "reviews": reviews, "likes": user_likes}
 
 @app.post("/api/releases")
-def add_release(rel: Release):
-    """Сохранение нового релиза"""
-    conn = get_db()
-    c = conn.cursor()
-    try:
-        c.execute("INSERT INTO releases (id, name, artist, img, link) VALUES (?,?,?,?,?)",
-                  (rel.id, rel.name, rel.artist, rel.img, rel.link))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass # Если такой ID уже есть
-    conn.close()
+async def add_release(rel: Release):
+    """Добавление релиза"""
+    await releases_col.update_one({"id": rel.id}, {"$set": rel.model_dump()}, upsert=True)
     return {"status": "ok"}
 
 @app.delete("/api/releases/{rel_id}")
-def delete_release(rel_id: str):
-    """Удаление релиза создателем"""
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM releases WHERE id=?", (rel_id,))
-    c.execute("DELETE FROM reviews WHERE relId=?", (rel_id,))
-    c.execute("DELETE FROM likes WHERE releaseId=?", (rel_id,))
-    conn.commit()
-    conn.close()
+async def delete_release(rel_id: str):
+    """Удаление релиза и всего, что с ним связано (для создателя)"""
+    await releases_col.delete_one({"id": rel_id})
+    await reviews_col.delete_many({"relId": rel_id})
+    await likes_col.delete_many({"releaseId": rel_id})
     return {"status": "ok"}
 
 @app.post("/api/reviews")
-def add_review(rev: Review):
-    """Добавление рецензии"""
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("INSERT INTO reviews (id, relId, author, text, rating, date) VALUES (?,?,?,?,?,?)",
-              (rev.id, rev.relId, rev.author, rev.text, rev.rating, rev.date))
-    conn.commit()
-    conn.close()
+async def add_review(rev: Review):
+    """Добавление отзыва"""
+    await reviews_col.insert_one(rev.model_dump())
     return {"status": "ok"}
 
 @app.post("/api/likes")
-def toggle_like(req: LikeReq):
-    """Ставим или убираем лайк"""
-    conn = get_db()
-    c = conn.cursor()
+async def toggle_like(req: LikeReq):
+    """Установка или снятие лайка"""
     if req.isLike:
-        c.execute("INSERT OR IGNORE INTO likes (releaseId, username) VALUES (?,?)", (req.releaseId, req.username))
+        await likes_col.update_one(
+            {"releaseId": req.releaseId, "username": req.username},
+            {"$set": {"releaseId": req.releaseId, "username": req.username}},
+            upsert=True
+        )
     else:
-        c.execute("DELETE FROM likes WHERE releaseId=? AND username=?", (req.releaseId, req.username))
-    conn.commit()
-    conn.close()
+        await likes_col.delete_one({"releaseId": req.releaseId, "username": req.username})
     return {"status": "ok"}
 
-
-# --- ИИ ПАРСЕР (Ваш старый код) ---
+# --- ИИ ПАРСЕР ССЫЛОК ---
 async def get_metadata_from_page(url: str):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         async with httpx.AsyncClient(follow_redirects=True, headers=headers) as h_client:
-            response = await h_client.get(url, timeout=10.0)
-            soup = BeautifulSoup(response.text, 'html.parser')
+            res = await h_client.get(url, timeout=10.0)
+            soup = BeautifulSoup(res.text, 'html.parser')
             title = soup.title.string if soup.title else ""
-            image = ""
+            img = ""
             og_image = soup.find("meta", property="og:image")
-            if og_image: image = og_image["content"]
-            return title.strip(), image
-    except Exception as e:
-        return "", ""
+            if og_image: img = og_image["content"]
+            return title.strip(), img
+    except: return "", ""
 
 @app.post("/api/parse_link")
 async def parse_link(req: LinkRequest):
-    if not client: raise HTTPException(status_code=500, detail="Сервер не настроен (API KEY).")
     raw_title, found_image = await get_metadata_from_page(req.link)
-    if not raw_title: raw_title = f"Ссылка: {req.link}"
-
+    if not client_ai: return {"artist": "Артист", "name": "Релиз", "img": found_image}
     try:
-        system_prompt = """
-        Ты - музыкальный парсер. Твоя цель: извлечь АРТИСТА и НАЗВАНИЕ трека/альбома из текста.
-        Убери мусор: 'Яндекс Музыка', 'YouTube', 'Слушать онлайн', 'Official Video', 'Lyrics'.
-        Верни ТОЛЬКО JSON: {"artist": "...", "name": "..."}.
-        Если не нашел, используй "Артист" и "Трек".
-        """
-        chat_completion = client.chat.completions.create(
+        chat = client_ai.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Текст для анализа: {raw_title}"}
-            ],
-            temperature=0.1,
+            messages=[{"role": "system", "content": "Return JSON: {'artist': '...', 'name': '...'}. Remove junk words."},
+                      {"role": "user", "content": raw_title or req.link}],
             response_format={"type": "json_object"}
         )
-        result = json.loads(chat_completion.choices[0].message.content)
+        result = json.loads(chat.choices[0].message.content)
         result["img"] = found_image
         return result
-    except Exception as e:
-        return {"artist": "Артист", "name": "Релиз", "img": found_image}
+    except: return {"artist": "Артист", "name": "Релиз", "img": found_image}
 
 if __name__ == "__main__":
     import uvicorn
