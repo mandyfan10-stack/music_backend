@@ -295,6 +295,7 @@ async def get_all_data(request: Request):
             "isAuthenticated": tg_user is not None,
         },
         "blockedUsers": blocked_list,
+        "adminUsernames": list(ADMIN_USERNAMES),
     }
 
 
