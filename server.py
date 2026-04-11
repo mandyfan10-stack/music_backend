@@ -414,8 +414,8 @@ async def delete_all_reviews_by_author(username: str, admin: TelegramUser = Depe
 # ============================
 async def get_metadata_from_page(url: str):
     if not BeautifulSoup:
-        return "", ""
-    headers = {"User-Agent": "Mozilla/5.0"}
+        return "", "", ""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     try:
         async with httpx.AsyncClient(follow_redirects=True, headers=headers, timeout=10.0) as h_client:
             res = await h_client.get(url)
@@ -423,34 +423,115 @@ async def get_metadata_from_page(url: str):
             soup = BeautifulSoup(res.text, "html.parser")
             title = str(soup.title.string) if soup.title and soup.title.string else ""
             img = ""
+            genre = ""
+
             og = soup.find("meta", property="og:image")
             if og and og.get("content"):
                 img = str(og["content"])
-            return title.strip(), img
+
+            # Пытаемся извлечь жанр из мета-тегов
+            for prop in ["og:music:genre", "music:genre", "genre"]:
+                tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
+                if tag and tag.get("content"):
+                    genre = tag["content"].strip()
+                    break
+
+            # Яндекс Музыка: жанр в JSON-LD или в breadcrumb
+            if "music.yandex" in url:
+                # JSON-LD
+                for script in soup.find_all("script", type="application/ld+json"):
+                    try:
+                        ld = json.loads(script.string)
+                        if isinstance(ld, dict):
+                            g = ld.get("genre") or ld.get("@graph", [{}])[0].get("genre", "")
+                            if g:
+                                genre = g if isinstance(g, str) else ", ".join(g)
+                                break
+                    except Exception:
+                        pass
+                # Breadcrumb / page text fallback
+                if not genre:
+                    for a in soup.find_all("a", class_=lambda c: c and "genre" in c.lower() if c else False):
+                        genre = a.get_text(strip=True)
+                        if genre:
+                            break
+
+            # Spotify: genre иногда в мета
+            if "spotify.com" in url and not genre:
+                og_desc = soup.find("meta", property="og:description")
+                if og_desc and og_desc.get("content"):
+                    desc = og_desc["content"]
+                    # "Listen to X on Spotify. Genre · Year"
+                    parts = desc.split("·")
+                    if len(parts) >= 2:
+                        candidate = parts[-1].strip().rstrip(".")
+                        if len(candidate) < 30 and not candidate.isdigit():
+                            genre = candidate
+
+            return title.strip(), img, genre
     except Exception:
-        return "", ""
+        return "", "", ""
+
+
+# Маппинг распространённых жанров на русский
+GENRE_MAP = {
+    "rap": "Рэп", "hip hop": "Хип-хоп", "hip-hop": "Хип-хоп", "hiphop": "Хип-хоп",
+    "trap": "Трэп", "r&b": "R&B", "rnb": "R&B", "pop": "Поп",
+    "rock": "Рок", "electronic": "Электронная", "edm": "Электронная",
+    "jazz": "Джаз", "metal": "Метал",
+    "рэп": "Рэп", "хип-хоп": "Хип-хоп", "трэп": "Трэп", "поп": "Поп",
+    "рок": "Рок", "электронная": "Электронная", "джаз": "Джаз", "метал": "Метал",
+    "indie": "Рок", "alternative": "Рок", "soul": "R&B",
+    "drill": "Трэп", "phonk": "Трэп", "lo-fi": "Хип-хоп",
+}
+
+
+def normalize_genre(raw: str) -> str:
+    """Нормализует жанр к одному из стандартных."""
+    if not raw:
+        return ""
+    low = raw.strip().lower()
+    # Прямое совпадение
+    if low in GENRE_MAP:
+        return GENRE_MAP[low]
+    # Частичное совпадение
+    for key, val in GENRE_MAP.items():
+        if key in low:
+            return val
+    return "Другое"
 
 
 @app.post("/api/parse_link")
 async def parse_link(req: LinkRequest, user: TelegramUser = Depends(require_admin)):
-    """Распознавание ссылки — только Создатель."""
-    raw_title, found_image = await get_metadata_from_page(req.link)
+    """Распознавание ссылки — только Создатель. Возвращает artist, name, img, genre."""
+    raw_title, found_image, raw_genre = await get_metadata_from_page(req.link)
+
+    detected_genre = normalize_genre(raw_genre)
+
     if not client_ai:
-        return {"artist": "Артист", "name": "Релиз", "img": found_image}
+        return {"artist": "Артист", "name": "Релиз", "img": found_image, "genre": detected_genre}
     try:
+        # Просим AI также определить жанр если мы его не нашли
+        genre_prompt = "" if detected_genre else " Also guess 'genre' from context."
         chat = client_ai.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "Return JSON: {'artist': '...', 'name': '...'}. Remove junk words."},
+                {"role": "system", "content": f"Return JSON: {{'artist': '...', 'name': '...'{', genre: ...' if not detected_genre else ''}}}. Remove junk words.{genre_prompt}"},
                 {"role": "user", "content": raw_title or req.link},
             ],
             response_format={"type": "json_object"},
         )
         result = json.loads(chat.choices[0].message.content)
         result["img"] = found_image
+
+        # Если AI вернул жанр, нормализуем
+        if not detected_genre and result.get("genre"):
+            detected_genre = normalize_genre(result["genre"])
+        result["genre"] = detected_genre
+
         return result
     except Exception:
-        return {"artist": "Артист", "name": "Релиз", "img": found_image}
+        return {"artist": "Артист", "name": "Релиз", "img": found_image, "genre": detected_genre}
 
 
 @app.get("/api/health")
