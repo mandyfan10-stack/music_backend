@@ -194,9 +194,6 @@ async def get_current_user(request: Request) -> TelegramUser:
 
 async def get_optional_user(request: Request) -> Optional[TelegramUser]:
     """Dependency: как get_current_user, но не бросает ошибку если нет заголовка."""
-    init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
-    if not init_data:
-        return None
     try:
         return await get_current_user(request)
     except HTTPException:
