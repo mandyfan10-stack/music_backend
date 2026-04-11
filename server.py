@@ -112,64 +112,75 @@ class TelegramUser:
 def validate_telegram_init_data(init_data: str) -> dict:
     """
     Проверяет подпись Telegram initData через HMAC-SHA256.
-    Возвращает dict с данными пользователя.
-    Бросает HTTPException если подпись невалидна.
+    Если TELEGRAM_BOT_TOKEN не задан — работает в dev-режиме (без криптопроверки).
     """
-    if not TELEGRAM_BOT_TOKEN:
-        raise HTTPException(400, "Telegram bot token not configured")
-
     parsed = parse_qs(init_data, keep_blank_values=True)
 
-    received_hash = parsed.get("hash", [None])[0]
-    if not received_hash:
-        raise HTTPException(401, "Missing hash in initData")
-
-    # Собираем строку для проверки (всё кроме hash, отсортировано)
-    check_pairs = []
-    for key in sorted(parsed.keys()):
-        if key == "hash":
-            continue
-        check_pairs.append(f"{key}={parsed[key][0]}")
-    data_check_string = "\n".join(check_pairs)
-
-    # HMAC-SHA256 проверка
-    secret_key = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
-    calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-
-    if not hmac.compare_digest(calculated_hash, received_hash):
-        raise HTTPException(401, "Invalid Telegram signature")
-
-    # Проверяем возраст данных
-    auth_date = int(parsed.get("auth_date", ["0"])[0])
-    if INIT_DATA_MAX_AGE > 0 and auth_date > 0:
-        age = int(time.time()) - auth_date
-        if age > INIT_DATA_MAX_AGE:
-            raise HTTPException(401, "initData expired")
-
-    # Парсим user
+    # Парсим user из initData (есть всегда, даже без токена)
     raw_user = parsed.get("user", [None])[0]
     if not raw_user:
         raise HTTPException(401, "No user in initData")
 
     try:
-        return json.loads(raw_user)
+        user_data = json.loads(raw_user)
     except Exception:
         raise HTTPException(401, "Invalid user payload")
+
+    # Если токен задан — полная криптопроверка
+    if TELEGRAM_BOT_TOKEN:
+        received_hash = parsed.get("hash", [None])[0]
+        if not received_hash:
+            raise HTTPException(401, "Missing hash in initData")
+
+        check_pairs = []
+        for key in sorted(parsed.keys()):
+            if key == "hash":
+                continue
+            check_pairs.append(f"{key}={parsed[key][0]}")
+        data_check_string = "\n".join(check_pairs)
+
+        secret_key = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+        if not hmac.compare_digest(calculated_hash, received_hash):
+            raise HTTPException(401, "Invalid Telegram signature")
+
+        auth_date = int(parsed.get("auth_date", ["0"])[0])
+        if INIT_DATA_MAX_AGE > 0 and auth_date > 0:
+            age = int(time.time()) - auth_date
+            if age > INIT_DATA_MAX_AGE:
+                raise HTTPException(401, "initData expired")
+    else:
+        print("⚠️  DEV MODE: Telegram signature NOT verified (set TELEGRAM_BOT_TOKEN for production)")
+
+    return user_data
 
 
 async def get_current_user(request: Request) -> TelegramUser:
     """
-    Dependency: извлекает и проверяет пользователя из заголовка X-Telegram-Init-Data.
+    Dependency: извлекает пользователя.
+    - Если есть X-Telegram-Init-Data → парсит (с проверкой или без, зависит от токена)
+    - Если нет initData, но есть X-Dev-Username → dev-режим (только без токена)
     """
     init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
-    if not init_data:
+
+    if init_data:
+        tg_user = validate_telegram_init_data(init_data)
+        user_id = tg_user.get("id", 0)
+        username = (tg_user.get("username") or "").strip().lower()
+        first_name = (tg_user.get("first_name") or "").strip()
+    elif not TELEGRAM_BOT_TOKEN:
+        # Dev-режим без Telegram: берём username из query/header
+        dev_name = request.headers.get("X-Dev-Username", "").strip()
+        if not dev_name:
+            dev_name = request.query_params.get("username", "guest")
+        clean = dev_name.replace("@", "").strip().lower()
+        username = clean or "guest"
+        first_name = dev_name
+        user_id = hash(username) % 10**9
+        print(f"⚠️  DEV MODE user: {username}")
+    else:
         raise HTTPException(401, "Authorization required: open from Telegram")
-
-    tg_user = validate_telegram_init_data(init_data)
-
-    user_id = tg_user.get("id", 0)
-    username = (tg_user.get("username") or "").strip().lower()
-    first_name = (tg_user.get("first_name") or "").strip()
 
     is_admin = username in ADMIN_USERNAMES
 
