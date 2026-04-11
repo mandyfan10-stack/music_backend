@@ -76,6 +76,7 @@ class Release(BaseModel):
     artist: str = Field(min_length=1)
     img: str = ""
     link: str = Field(min_length=1)
+    genre: str = ""
     timestamp: float = 0
 
 class Review(BaseModel):
