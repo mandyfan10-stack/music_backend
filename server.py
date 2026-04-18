@@ -35,6 +35,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
 # ============================
 # КОНФИГУРАЦИЯ (всё через env)
 # ============================
@@ -44,6 +53,7 @@ if not MONGO_URL:
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 INIT_DATA_MAX_AGE = int(os.getenv("INIT_DATA_MAX_AGE", "86400"))
+DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
 
 # Список admin-юзернеймов (через запятую, без @)
 ADMIN_USERNAMES = set(
@@ -127,32 +137,35 @@ def validate_telegram_init_data(init_data: str) -> dict:
     except Exception:
         raise HTTPException(401, "Invalid user payload")
 
-    # Если токен задан — полная криптопроверка
-    if TELEGRAM_BOT_TOKEN:
-        received_hash = parsed.get("hash", [None])[0]
-        if not received_hash:
-            raise HTTPException(401, "Missing hash in initData")
-
-        check_pairs = []
-        for key in sorted(parsed.keys()):
-            if key == "hash":
-                continue
-            check_pairs.append(f"{key}={parsed[key][0]}")
-        data_check_string = "\n".join(check_pairs)
-
-        secret_key = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
-        calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-
-        if not hmac.compare_digest(calculated_hash, received_hash):
-            raise HTTPException(401, "Invalid Telegram signature")
-
-        auth_date = int(parsed.get("auth_date", ["0"])[0])
-        if INIT_DATA_MAX_AGE > 0 and auth_date > 0:
-            age = int(time.time()) - auth_date
-            if age > INIT_DATA_MAX_AGE:
-                raise HTTPException(401, "initData expired")
-    else:
+    if not TELEGRAM_BOT_TOKEN:
+        if not DEV_MODE:
+            raise HTTPException(500, "Server configuration error: TELEGRAM_BOT_TOKEN is not set")
         print("⚠️  DEV MODE: Telegram signature NOT verified (set TELEGRAM_BOT_TOKEN for production)")
+        return user_data
+
+    # Полная криптопроверка
+    received_hash = parsed.get("hash", [None])[0]
+    if not received_hash:
+        raise HTTPException(401, "Missing hash in initData")
+
+    check_pairs = []
+    for key in sorted(parsed.keys()):
+        if key == "hash":
+            continue
+        check_pairs.append(f"{key}={parsed[key][0]}")
+    data_check_string = "\n".join(check_pairs)
+
+    secret_key = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(calculated_hash, received_hash):
+        raise HTTPException(401, "Invalid Telegram signature")
+
+    auth_date = int(parsed.get("auth_date", ["0"])[0])
+    if INIT_DATA_MAX_AGE > 0 and auth_date > 0:
+        age = int(time.time()) - auth_date
+        if age > INIT_DATA_MAX_AGE:
+            raise HTTPException(401, "initData expired")
 
     return user_data
 
@@ -161,7 +174,7 @@ async def get_current_user(request: Request) -> TelegramUser:
     """
     Dependency: извлекает пользователя.
     - Если есть X-Telegram-Init-Data → парсит (с проверкой или без, зависит от токена)
-    - Если нет initData, но есть X-Dev-Username → dev-режим (только без токена)
+    - Если нет initData, но есть X-Dev-Username → dev-режим (только если разрешен)
     """
     init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
 
@@ -170,7 +183,7 @@ async def get_current_user(request: Request) -> TelegramUser:
         user_id = tg_user.get("id", 0)
         username = (tg_user.get("username") or "").strip().lower()
         first_name = (tg_user.get("first_name") or "").strip()
-    elif not TELEGRAM_BOT_TOKEN:
+    elif not TELEGRAM_BOT_TOKEN and DEV_MODE:
         # Dev-режим без Telegram: берём username из query/header
         dev_name = request.headers.get("X-Dev-Username", "").strip()
         if not dev_name:
