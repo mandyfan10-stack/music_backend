@@ -1,8 +1,9 @@
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 import os
+import html
 import hmac
 import hashlib
 import json
@@ -89,6 +90,20 @@ class Release(BaseModel):
     genre: str = ""
     timestamp: float = 0
 
+    @field_validator("name", "artist", "genre", mode="before")
+    @classmethod
+    def sanitize_strings(cls, v):
+        if isinstance(v, str):
+            return html.escape(v)
+        return v
+
+    @field_validator("img", "link", mode="after")
+    @classmethod
+    def check_urls(cls, v):
+        if v and not v.startswith(("http://", "https://")):
+            raise ValueError("URL must start with http:// or https://")
+        return v
+
 class Review(BaseModel):
     id: str = Field(min_length=1)
     relId: str = Field(min_length=1)
@@ -97,6 +112,13 @@ class Review(BaseModel):
     baseRating: int = Field(ge=1, le=10, default=5)
     criteria: dict = {}
     objectiveRating: float = Field(ge=0, le=10, default=5.0)
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def sanitize_text(cls, v):
+        if isinstance(v, str):
+            return html.escape(v)
+        return v
 
 class LikeReq(BaseModel):
     releaseId: str = Field(min_length=1)
