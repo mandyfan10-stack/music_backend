@@ -90,7 +90,7 @@ class Release(BaseModel):
     genre: str = ""
     timestamp: float = 0
 
-    @field_validator("name", "artist", "genre", mode="before")
+    @field_validator("id", "name", "artist", "genre", mode="before")
     @classmethod
     def sanitize_strings(cls, v):
         if isinstance(v, str):
@@ -113,11 +113,21 @@ class Review(BaseModel):
     criteria: dict = {}
     objectiveRating: float = Field(ge=0, le=10, default=5.0)
 
-    @field_validator("text", mode="before")
+    @field_validator("id", "relId", "text", mode="before")
     @classmethod
     def sanitize_text(cls, v):
         if isinstance(v, str):
             return html.escape(v)
+        return v
+
+    @field_validator("criteria", mode="before")
+    @classmethod
+    def sanitize_criteria(cls, v):
+        if isinstance(v, dict):
+            return {
+                html.escape(str(k)): (html.escape(str(val)) if isinstance(val, str) else val)
+                for k, val in v.items()
+            }
         return v
 
 class LikeReq(BaseModel):
