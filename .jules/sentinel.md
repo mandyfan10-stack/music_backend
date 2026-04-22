@@ -6,3 +6,7 @@
 **Vulnerability:** Found Stored XSS vulnerability where users could submit malicious HTML/JavaScript in the `text` field of `Review` models, and `name`/`artist`/`genre` in `Release` models. The `img` and `link` fields were also susceptible to `javascript:` scheme attacks.
 **Learning:** Pydantic models validate types and constraints but do not automatically sanitize input strings. In a FastAPI application taking user input that is later rendered in a UI, this creates a major XSS risk if the UI doesn't strictly escape content.
 **Prevention:** Use Pydantic's `@field_validator` with `mode="before"` to run `html.escape()` on string fields before they are accepted, and explicitly check URL fields using `startswith(("http://", "https://"))`.
+## 2024-05-24 - Pydantic Nested Dictionary XSS Vulnerability
+**Vulnerability:** XSS payload allowed through nested dictionaries (`criteria: dict = {}`) in Pydantic models.
+**Learning:** Pydantic's standard `dict` fields bypass custom string sanitization validators defined for string fields. If a string inside a nested structure (dict or list) is not explicitly sanitized, it can carry XSS payloads.
+**Prevention:** Implement a recursive sanitization function for dict/list fields or use customized Pydantic models/types that sanitize strings implicitly.

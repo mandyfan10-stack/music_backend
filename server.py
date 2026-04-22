@@ -120,6 +120,19 @@ class Review(BaseModel):
             return html.escape(v)
         return v
 
+    @field_validator("criteria", mode="before")
+    @classmethod
+    def sanitize_criteria(cls, v):
+        def sanitize(obj):
+            if isinstance(obj, str):
+                return html.escape(obj)
+            elif isinstance(obj, dict):
+                return {sanitize(k): sanitize(val) for k, val in obj.items()}
+            elif isinstance(obj, list):
+                return [sanitize(item) for item in obj]
+            return obj
+        return sanitize(v)
+
 class LikeReq(BaseModel):
     releaseId: str = Field(min_length=1)
     isLike: bool
