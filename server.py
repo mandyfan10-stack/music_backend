@@ -9,7 +9,10 @@ import hashlib
 import json
 import time
 import httpx
+import ipaddress
+import socket
 from urllib.parse import parse_qs
+from urllib.parse import urlparse
 from motor.motor_asyncio import AsyncIOMotorClient
 
 try:
@@ -73,6 +76,11 @@ blocked_col = db["blocked_users"]
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 client_ai = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY and Groq is not None else None
+GROQ_MODEL_PRIMARY = os.getenv("GROQ_MODEL_PRIMARY", "llama-3.3-70b-versatile")
+GROQ_MODEL_FALLBACKS = [
+    m.strip() for m in os.getenv("GROQ_MODEL_FALLBACKS", "llama-3.1-8b-instant").split(",") if m.strip()
+]
+GROQ_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "2"))
 
 
 # ============================
@@ -110,7 +118,7 @@ class Review(BaseModel):
     text: str = Field(min_length=30, max_length=3000)
     rating: float = Field(ge=0, le=10)
     baseRating: int = Field(ge=1, le=10, default=5)
-    criteria: dict = {}
+    criteria: dict = Field(default_factory=dict)
     objectiveRating: float = Field(ge=0, le=10, default=5.0)
 
     @field_validator("text", mode="before")
@@ -275,7 +283,7 @@ async def create_indexes():
         await reviews_col.create_index("id", unique=True)
         await reviews_col.create_index("relId")
         await reviews_col.create_index("author")
-        await likes_col.create_index([("releaseId", 1), ("username", 1)], unique=True)
+        await likes_col.create_index([("releaseId", 1), ("userId", 1)], unique=True)
         await blocked_col.create_index("username", unique=True)
     except Exception as exc:
         print(f"Index warning: {exc}")
@@ -317,7 +325,9 @@ async def get_all_data(request: Request):
         is_admin = tg_user.is_admin
 
         if tg_user.username:
-            likes = await likes_col.find({"username": tg_user.display_name}).to_list(length=1000)
+            likes = await likes_col.find({
+                "$or": [{"userId": tg_user.user_id}, {"username": tg_user.username}]
+            }).to_list(length=1000)
             user_likes = [l["releaseId"] for l in likes]
             # Проверка блокировки
             blocked_doc = await blocked_col.find_one({"username": tg_user.username})
@@ -341,7 +351,6 @@ async def get_all_data(request: Request):
             "isAuthenticated": tg_user is not None,
         },
         "blockedUsers": blocked_list,
-        "adminUsernames": list(ADMIN_USERNAMES),
     }
 
 
@@ -419,16 +428,16 @@ async def toggle_like(req: LikeReq, user: TelegramUser = Depends(check_not_block
     """Лайк/анлайк — только авторизованные, не заблокированные."""
     if req.isLike:
         await likes_col.update_one(
-            {"releaseId": req.releaseId, "username": user.display_name},
+            {"releaseId": req.releaseId, "userId": user.user_id},
             {"$set": {
                 "releaseId": req.releaseId,
-                "username": user.display_name,
+                "username": user.username,
                 "userId": user.user_id
             }},
             upsert=True,
         )
     else:
-        await likes_col.delete_one({"releaseId": req.releaseId, "username": user.display_name})
+        await likes_col.delete_one({"releaseId": req.releaseId, "userId": user.user_id})
     return {"status": "ok"}
 
 
@@ -521,6 +530,68 @@ async def get_metadata_from_page(url: str):
         return "", "", ""
 
 
+def is_safe_public_url(url: str) -> bool:
+    """Basic SSRF protection: allow only http(s) and public IP targets."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        if host.lower() in {"localhost"}:
+            return False
+        addr_info = socket.getaddrinfo(host, None)
+        for info in addr_info:
+            ip = ipaddress.ip_address(info[4][0])
+            if any([
+                ip.is_private,
+                ip.is_loopback,
+                ip.is_link_local,
+                ip.is_multicast,
+                ip.is_reserved,
+            ]):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def ai_extract_release(raw_title: str, link: str, detected_genre: str) -> dict:
+    if not client_ai:
+        return {"artist": "Артист", "name": "Релиз", "genre": detected_genre}
+
+    models = [GROQ_MODEL_PRIMARY, *GROQ_MODEL_FALLBACKS]
+    prompt_suffix = "" if detected_genre else " Also guess 'genre' from context."
+    last_error = None
+
+    for model_name in models:
+        for _ in range(max(1, GROQ_MAX_RETRIES)):
+            try:
+                chat = client_ai.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Return JSON with keys: artist, name"
+                                + (", genre" if not detected_genre else "")
+                                + f". Remove junk words.{prompt_suffix}"
+                            ),
+                        },
+                        {"role": "user", "content": raw_title or link},
+                    ],
+                    response_format={"type": "json_object"},
+                )
+                return json.loads(chat.choices[0].message.content)
+            except Exception as exc:
+                last_error = exc
+                continue
+
+    print(f"AI parsing fallback used due to error: {last_error}")
+    return {"artist": "Артист", "name": "Релиз", "genre": detected_genre}
+
+
 # Маппинг распространённых жанров на русский
 GENRE_MAP = {
     "rap": "Рэп", "hip hop": "Хип-хоп", "hip-hop": "Хип-хоп", "hiphop": "Хип-хоп",
@@ -552,39 +623,23 @@ def normalize_genre(raw: str) -> str:
 @app.post("/api/parse_link")
 async def parse_link(req: LinkRequest, user: TelegramUser = Depends(require_admin)):
     """Распознавание ссылки — только Создатель. Возвращает artist, name, img, genre."""
+    if not is_safe_public_url(req.link):
+        raise HTTPException(400, "Unsafe or unsupported URL")
+
     raw_title, found_image, raw_genre = await get_metadata_from_page(req.link)
 
     detected_genre = normalize_genre(raw_genre)
-
-    if not client_ai:
-        return {"artist": "Артист", "name": "Релиз", "img": found_image, "genre": detected_genre}
-    try:
-        # Просим AI также определить жанр если мы его не нашли
-        genre_prompt = "" if detected_genre else " Also guess 'genre' from context."
-        chat = client_ai.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": f"Return JSON: {{'artist': '...', 'name': '...'{', genre: ...' if not detected_genre else ''}}}. Remove junk words.{genre_prompt}"},
-                {"role": "user", "content": raw_title or req.link},
-            ],
-            response_format={"type": "json_object"},
-        )
-        result = json.loads(chat.choices[0].message.content)
-        result["img"] = found_image
-
-        # Если AI вернул жанр, нормализуем
-        if not detected_genre and result.get("genre"):
-            detected_genre = normalize_genre(result["genre"])
-        result["genre"] = detected_genre
-
-        return result
-    except Exception:
-        return {"artist": "Артист", "name": "Релиз", "img": found_image, "genre": detected_genre}
+    result = ai_extract_release(raw_title, req.link, detected_genre)
+    result["img"] = found_image
+    if not detected_genre and result.get("genre"):
+        detected_genre = normalize_genre(result["genre"])
+    result["genre"] = detected_genre
+    return result
 
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "auth": bool(TELEGRAM_BOT_TOKEN), "admins": list(ADMIN_USERNAMES)}
+    return {"status": "ok", "auth": bool(TELEGRAM_BOT_TOKEN)}
 
 
 if __name__ == "__main__":
