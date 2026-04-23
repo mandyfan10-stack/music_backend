@@ -98,7 +98,7 @@ class Release(BaseModel):
     genre: str = ""
     timestamp: float = 0
 
-    @field_validator("name", "artist", "genre", mode="before")
+    @field_validator("id", "name", "artist", "genre", mode="before")
     @classmethod
     def sanitize_strings(cls, v):
         if isinstance(v, str):
@@ -121,9 +121,9 @@ class Review(BaseModel):
     criteria: dict = Field(default_factory=dict)
     objectiveRating: float = Field(ge=0, le=10, default=5.0)
 
-    @field_validator("text", mode="before")
+    @field_validator("id", "relId", "text", mode="before")
     @classmethod
-    def sanitize_text(cls, v):
+    def sanitize_strings(cls, v):
         if isinstance(v, str):
             return html.escape(v)
         return v
@@ -149,6 +149,13 @@ class BlockReq(BaseModel):
     username: str = Field(min_length=1)
     blocked: bool
 
+    @field_validator("username", mode="before")
+    @classmethod
+    def sanitize_username(cls, v):
+        if isinstance(v, str):
+            return html.escape(v)
+        return v
+
 
 # ============================
 # АВТОРИЗАЦИЯ ПО TELEGRAM initData
@@ -157,10 +164,10 @@ class TelegramUser:
     """Авторизованный пользователь из Telegram initData"""
     def __init__(self, user_id: int, username: str, first_name: str, is_admin: bool):
         self.user_id = user_id
-        self.username = username  # без @, lowercase
-        self.first_name = first_name
+        self.username = html.escape(username) if username else ""  # без @, lowercase
+        self.first_name = html.escape(first_name) if first_name else ""
         self.is_admin = is_admin
-        self.display_name = f"@{username}" if username else first_name or f"user-{user_id}"
+        self.display_name = f"@{self.username}" if self.username else self.first_name or f"user-{self.user_id}"
 
 
 def validate_telegram_init_data(init_data: str) -> dict:
