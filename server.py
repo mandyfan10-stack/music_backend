@@ -474,9 +474,20 @@ async def get_metadata_from_page(url: str):
         return "", "", ""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     try:
-        async with httpx.AsyncClient(follow_redirects=True, headers=headers, timeout=10.0) as h_client:
-            res = await h_client.get(url)
-            res.raise_for_status()
+        async with httpx.AsyncClient(follow_redirects=False, headers=headers, timeout=10.0) as h_client:
+            current_url = url
+            for _ in range(5):
+                if not is_safe_public_url(current_url):
+                    return "", "", ""
+                res = await h_client.get(current_url)
+                if res.is_redirect:
+                    current_url = str(res.next_request.url)
+                    continue
+                res.raise_for_status()
+                break
+            else:
+                return "", "", ""
+
             soup = BeautifulSoup(res.text, "html.parser")
             title = str(soup.title.string) if soup.title and soup.title.string else ""
             img = ""

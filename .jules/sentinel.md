@@ -10,3 +10,8 @@
 **Vulnerability:** XSS payload allowed through nested dictionaries (`criteria: dict = {}`) in Pydantic models.
 **Learning:** Pydantic's standard `dict` fields bypass custom string sanitization validators defined for string fields. If a string inside a nested structure (dict or list) is not explicitly sanitized, it can carry XSS payloads.
 **Prevention:** Implement a recursive sanitization function for dict/list fields or use customized Pydantic models/types that sanitize strings implicitly.
+
+## 2026-04-22 - [HIGH] Fix SSRF Bypass via HTTP Redirects
+**Vulnerability:** A Server-Side Request Forgery (SSRF) mitigation was implemented via `is_safe_public_url()` to check user-supplied URLs before requesting them. However, `httpx.AsyncClient` was configured with `follow_redirects=True`. This allowed an attacker to supply a safe external URL (e.g., `http://example.com/redirect?to=http://localhost`) that passed the initial check, but then instructed the HTTP client to automatically redirect to an internal or unsafe resource, completely bypassing the validation.
+**Learning:** Automatic redirect following in HTTP clients fundamentally breaks URL validation checks executed before the request. The client will transparently redirect to new URLs that the validation logic never analyzed.
+**Prevention:** Always disable automatic redirect following (`follow_redirects=False`) when fetching user-supplied URLs if SSRF mitigations are needed. Implement a manual redirect loop (with a maximum hop count) that extracts the redirect URL, runs it through the safety validation check, and explicitly drops the connection if the new destination is unsafe.
