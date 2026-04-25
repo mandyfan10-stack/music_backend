@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
+from pymongo.errors import DuplicateKeyError
+from collections import defaultdict
 import os
 import html
 import hmac
@@ -52,19 +54,38 @@ async def add_security_headers(request: Request, call_next):
 # КОНФИГУРАЦИЯ (всё через env)
 # ============================
 MONGO_URL = os.getenv("MONGO_URL", "")
-if not MONGO_URL:
-    raise RuntimeError("MONGO_URL not set")
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 INIT_DATA_MAX_AGE = int(os.getenv("INIT_DATA_MAX_AGE", "86400"))
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
+ENV = os.getenv("ENV", "development")
 
-# Список admin-юзернеймов (через запятую, без @)
-ADMIN_USERNAMES = set(
-    u.strip().lower()
-    for u in os.getenv("ADMIN_USERNAMES", "monetka_man,xllbloodxii").split(",")
-    if u.strip()
-)
+ADMIN_USERNAMES = set()
+
+def validate_settings():
+    global ADMIN_USERNAMES, DEV_MODE
+    if not MONGO_URL:
+        raise RuntimeError("MONGO_URL not set")
+
+    if ENV == "production":
+        if DEV_MODE:
+            raise RuntimeError("DEV_MODE cannot be true when ENV is production")
+        if not TELEGRAM_BOT_TOKEN:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN is required in production")
+
+    admin_users_str = os.getenv("ADMIN_USERNAMES")
+    if not admin_users_str:
+        if ENV == "production":
+            raise RuntimeError("ADMIN_USERNAMES must be set in production")
+        else:
+            admin_users_str = ""
+
+    ADMIN_USERNAMES = set(
+        u.strip().lower()
+        for u in admin_users_str.split(",")
+        if u.strip()
+    )
+
+validate_settings()
 
 client_db = AsyncIOMotorClient(MONGO_URL)
 db = client_db["raper_xxii_database"]
@@ -81,6 +102,23 @@ GROQ_MODEL_FALLBACKS = [
     m.strip() for m in os.getenv("GROQ_MODEL_FALLBACKS", "llama-3.1-8b-instant").split(",") if m.strip()
 ]
 GROQ_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "2"))
+
+
+
+class RateLimiter:
+    def __init__(self, requests_per_minute: int = 30):
+        self.requests_per_minute = requests_per_minute
+        self.clients = defaultdict(list)
+
+    async def __call__(self, request: Request):
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.time()
+        self.clients[client_ip] = [t for t in self.clients[client_ip] if now - t < 60]
+        if len(self.clients[client_ip]) >= self.requests_per_minute:
+            raise HTTPException(status_code=429, detail="Too many requests")
+        self.clients[client_ip].append(now)
+
+rate_limiter = RateLimiter(requests_per_minute=20)
 
 
 # ============================
@@ -241,7 +279,7 @@ async def get_current_user(request: Request) -> TelegramUser:
         clean = dev_name.replace("@", "").strip().lower()
         username = clean or "guest"
         first_name = dev_name
-        user_id = hash(username) % 10**9
+        user_id = int(hashlib.sha256(username.encode("utf-8")).hexdigest()[:15], 16) % 10**9
         print(f"⚠️  DEV MODE user: {username}")
     else:
         raise HTTPException(401, "Authorization required: open from Telegram")
@@ -260,8 +298,10 @@ async def get_optional_user(request: Request) -> Optional[TelegramUser]:
     """Dependency: как get_current_user, но не бросает ошибку если нет заголовка."""
     try:
         return await get_current_user(request)
-    except HTTPException:
-        return None
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            return None
+        raise
 
 
 async def require_admin(user: TelegramUser = Depends(get_current_user)) -> TelegramUser:
@@ -290,6 +330,7 @@ async def create_indexes():
         await reviews_col.create_index("id", unique=True)
         await reviews_col.create_index("relId")
         await reviews_col.create_index("author")
+        await reviews_col.create_index([("relId", 1), ("authorId", 1)], unique=True)
         await likes_col.create_index([("releaseId", 1), ("userId", 1)], unique=True)
         await blocked_col.create_index("username", unique=True)
     except Exception as exc:
@@ -381,7 +422,7 @@ async def delete_release(rel_id: str, user: TelegramUser = Depends(require_admin
 
 
 @app.post("/api/reviews")
-async def add_review(rev: Review, user: TelegramUser = Depends(check_not_blocked)):
+async def add_review(rev: Review, user: TelegramUser = Depends(check_not_blocked), _=Depends(rate_limiter)):
     """
     Добавить рецензию.
     - Автор определяется из Telegram (нельзя подделать).
@@ -407,7 +448,10 @@ async def add_review(rev: Review, user: TelegramUser = Depends(check_not_blocked
     data["authorUsername"] = user.username
     data["date"] = time.strftime("%d.%m.%Y")
     data["timestamp"] = time.time() * 1000
-    await reviews_col.insert_one(data)
+    try:
+        await reviews_col.insert_one(data)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="User already reviewed this release")
     return {"status": "ok", "review": clean_doc(data)}
 
 
@@ -431,7 +475,7 @@ async def delete_review(review_id: str, user: TelegramUser = Depends(get_current
 
 
 @app.post("/api/likes")
-async def toggle_like(req: LikeReq, user: TelegramUser = Depends(check_not_blocked)):
+async def toggle_like(req: LikeReq, user: TelegramUser = Depends(check_not_blocked), _=Depends(rate_limiter)):
     """Лайк/анлайк — только авторизованные, не заблокированные."""
     if req.isLike:
         await likes_col.update_one(
@@ -639,7 +683,7 @@ def normalize_genre(raw: str) -> str:
 
 
 @app.post("/api/parse_link")
-async def parse_link(req: LinkRequest, user: TelegramUser = Depends(require_admin)):
+async def parse_link(req: LinkRequest, user: TelegramUser = Depends(require_admin), _=Depends(rate_limiter)):
     """Распознавание ссылки — только Создатель. Возвращает artist, name, img, genre."""
     if not is_safe_public_url(req.link):
         raise HTTPException(400, "Unsafe or unsupported URL")
