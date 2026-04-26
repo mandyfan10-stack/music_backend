@@ -392,6 +392,13 @@ async def record_release_sync_event(kind: str, release_id: str, sync_token: int)
     })
 
 
+async def get_current_sync_cursor(releases: list[dict]) -> int:
+    release_cursor = max((get_release_sync_token(release) for release in releases), default=0)
+    latest_events = await sync_events_col.find().sort("syncToken", -1).to_list(length=1)
+    event_cursor = max((int(event.get("syncToken") or 0) for event in latest_events), default=0)
+    return max(release_cursor, event_cursor)
+
+
 # ============================
 # API ЭНДПОИНТЫ
 # ============================
@@ -403,6 +410,7 @@ async def get_all_data(request: Request):
 
     releases = await releases_col.find().sort("timestamp", -1).to_list(length=100)
     all_reviews = await reviews_col.find().sort("timestamp", -1).to_list(length=500)
+    sync_cursor = await get_current_sync_cursor(releases)
 
     for r in releases: clean_doc(r)
     for r in all_reviews: clean_doc(r)
@@ -446,6 +454,7 @@ async def get_all_data(request: Request):
             "isAuthenticated": tg_user is not None,
         },
         "blockedUsers": blocked_list,
+        "syncCursor": sync_cursor,
     }
 
 

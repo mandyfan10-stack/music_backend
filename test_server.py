@@ -30,6 +30,12 @@ class FakeCursor:
         return self.items[:length]
 
 
+class FakeRequest:
+    headers = {}
+    query_params = {}
+    client = None
+
+
 def test_config_validation_production_no_token(clean_env):
     os.environ["ENV"] = "production"
     os.environ["MONGO_URL"] = "mongodb://localhost"
@@ -281,6 +287,61 @@ async def test_sync_releases_incremental_changes(clean_env):
     assert result["serverTime"] == 200
     assert result["deletedReleaseIds"] == ["rel-2"]
     assert result["releases"] == [{"id": "rel-1", "name": "Album", "syncToken": 101}]
+
+
+@pytest.mark.asyncio
+async def test_get_all_data_returns_sync_cursor_for_resume(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.releases_col.find = lambda query=None: FakeCursor([
+        {"_id": "mongo-id", "id": "rel-1", "name": "Album", "syncToken": 100},
+    ])
+    server.reviews_col.find = lambda query=None: FakeCursor([])
+    server.sync_events_col.find = lambda query=None: FakeCursor([
+        {"kind": "release_deleted", "releaseId": "rel-2", "syncToken": 150},
+    ])
+
+    result = await server.get_all_data(FakeRequest())
+
+    assert result["syncCursor"] == 150
+    assert result["releases"] == [{"id": "rel-1", "name": "Album", "syncToken": 100}]
+
+
+@pytest.mark.asyncio
+async def test_sync_releases_catches_up_after_polling_pause(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    events = [
+        {"kind": "release_upserted", "releaseId": "rel-2", "syncToken": 151},
+        {"kind": "release_upserted", "releaseId": "rel-3", "syncToken": 152},
+    ]
+
+    def fake_release_find(query=None):
+        assert query == {"id": {"$in": ["rel-2", "rel-3"]}}
+        return FakeCursor([
+            {"_id": "mongo-id-2", "id": "rel-2", "name": "Second", "syncToken": 151},
+            {"_id": "mongo-id-3", "id": "rel-3", "name": "Third", "syncToken": 152},
+        ])
+
+    server.sync_events_col.find = lambda query=None: FakeCursor(events)
+    server.releases_col.find = fake_release_find
+    server.next_sync_token = lambda: 200
+
+    result = await server.sync_releases(since=150, limit=100)
+
+    assert result["cursor"] == 152
+    assert [release["id"] for release in result["releases"]] == ["rel-2", "rel-3"]
+    assert result["deletedReleaseIds"] == []
 
 
 @pytest.mark.asyncio

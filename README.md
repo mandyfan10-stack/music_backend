@@ -12,9 +12,11 @@ python -m pytest -q
 
 ## Release Sync
 
-Clients can load the initial catalog with `GET /api/data`, then poll
-`GET /api/sync/releases?since=<cursor>` for fast incremental updates.
-Use the returned `cursor` value on the next request. The response includes:
+Clients can load the initial catalog with `GET /api/data`, store its
+`syncCursor`, then poll `GET /api/sync/releases?since=<syncCursor>` for fast
+incremental updates. Use the returned `cursor` value on the next request.
+If polling pauses while the user is on another UI tab, resume with the last
+stored cursor to catch up on missed changes. The response includes:
 
 - `releases`: new or updated releases.
 - `deletedReleaseIds`: releases removed since the previous cursor.
