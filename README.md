@@ -22,6 +22,13 @@ stored cursor to catch up on missed changes. The response includes:
 - `deletedReleaseIds`: releases removed since the previous cursor.
 - `hasMore`: `true` when the client should immediately request the next page.
 
+## Link Parsing
+
+Yandex Music links are parsed through the Yandex Music API first, including
+album/track titles, artists, labels, and cover URLs. AI parsing is only used as
+a fallback when real page metadata is available; it should not invent release
+data from an empty page or a URL alone.
+
 ## Environment Variables
 
 - `MONGO_URL` (Required): MongoDB connection string.
