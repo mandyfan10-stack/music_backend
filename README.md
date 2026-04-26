@@ -1,6 +1,15 @@
 # Music Backend
 Backend for music platform.
 
+## Development
+
+Install development dependencies and run tests:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
 ## Environment Variables
 
 - `MONGO_URL` (Required): MongoDB connection string.

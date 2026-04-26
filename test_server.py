@@ -2,8 +2,12 @@ import pytest
 import os
 import importlib
 from fastapi import HTTPException
-import asyncio
-from unittest.mock import AsyncMock, patch
+import hashlib
+import hmac
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from urllib.parse import urlencode
 
 @pytest.fixture
 def clean_env():
@@ -60,6 +64,68 @@ def test_config_validation_success(clean_env):
     importlib.reload(server)
     assert "admin" in server.ADMIN_USERNAMES
 
+def test_config_validation_normalizes_admin_usernames(clean_env):
+    os.environ["ENV"] = "production"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+    os.environ["ADMIN_USERNAMES"] = "@Admin, SecondAdmin"
+    os.environ["DEV_MODE"] = "false"
+
+    import server
+    importlib.reload(server)
+    assert server.ADMIN_USERNAMES == {"admin", "secondadmin"}
+
+
+def _signed_init_data(token: str, fields: dict) -> str:
+    data_check_string = "\n".join(f"{key}={fields[key]}" for key in sorted(fields))
+    secret_key = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    fields = dict(fields)
+    fields["hash"] = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+    return urlencode(fields)
+
+
+def test_validate_telegram_init_data_requires_auth_date(clean_env):
+    os.environ["ENV"] = "production"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+    os.environ["DEV_MODE"] = "false"
+
+    import server
+    importlib.reload(server)
+
+    init_data = _signed_init_data("token", {
+        "user": json.dumps({"id": 1, "username": "admin", "first_name": "Admin"}, separators=(",", ":")),
+    })
+
+    with pytest.raises(HTTPException) as exc_info:
+        server.validate_telegram_init_data(init_data)
+
+    assert exc_info.value.status_code == 401
+    assert "auth_date" in exc_info.value.detail
+
+
+def test_validate_telegram_init_data_rejects_invalid_auth_date(clean_env):
+    os.environ["ENV"] = "production"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+    os.environ["DEV_MODE"] = "false"
+
+    import server
+    importlib.reload(server)
+
+    init_data = _signed_init_data("token", {
+        "auth_date": "not-a-timestamp",
+        "user": json.dumps({"id": 1, "username": "admin", "first_name": "Admin"}, separators=(",", ":")),
+    })
+
+    with pytest.raises(HTTPException) as exc_info:
+        server.validate_telegram_init_data(init_data)
+
+    assert exc_info.value.status_code == 401
+    assert "auth_date" in exc_info.value.detail
+
 @pytest.mark.asyncio
 async def test_require_admin():
     import server
@@ -88,3 +154,53 @@ async def test_duplicate_review(clean_env):
         await server.add_review(rev, user)
 
     assert exc_info.value.status_code == 409
+
+@pytest.mark.asyncio
+async def test_toggle_like_requires_existing_release(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.releases_col.find_one = AsyncMock(return_value=None)
+    server.likes_col.update_one = AsyncMock()
+
+    user = server.TelegramUser(user_id=1, username="test", first_name="Test", is_admin=False)
+    req = server.LikeReq(releaseId="missing", isLike=True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await server.toggle_like(req, user)
+
+    assert exc_info.value.status_code == 404
+    server.likes_col.update_one.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delete_all_reviews_by_author_normalizes_username(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.reviews_col.delete_many = AsyncMock(return_value=SimpleNamespace(deleted_count=2))
+
+    admin = server.TelegramUser(user_id=1, username="admin", first_name="Admin", is_admin=True)
+    result = await server.delete_all_reviews_by_author("@TargetUser", admin)
+
+    assert result == {"status": "ok", "deleted": 2}
+    server.reviews_col.delete_many.assert_awaited_once_with({"authorUsername": "targetuser"})
+
+
+def test_is_safe_public_url_rejects_credentials(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    assert server.is_safe_public_url("https://user:pass@example.com/path") is False
