@@ -18,6 +18,7 @@ import socket
 from urllib.parse import parse_qs
 from urllib.parse import urljoin
 from urllib.parse import urlparse
+from urllib.parse import unquote
 from motor.motor_asyncio import AsyncIOMotorClient
 
 try:
@@ -661,7 +662,16 @@ def parse_yandex_music_url(url: str) -> dict:
             value = parts[index + 1]
             if value.isdigit():
                 result[f"{part}_id"] = value
+    query = parse_qs(parsed.query)
+    track_id = query.get("track", [None])[0]
+    if track_id and track_id.isdigit():
+        result["track_id"] = track_id
     return result
+
+
+def is_yandex_music_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host in {"music.yandex.ru", "music.yandex.com"}
 
 
 def yandex_cover_url(cover_uri: str) -> str:
@@ -863,7 +873,7 @@ def parse_ai_json(content: str) -> dict:
 
 
 def guess_release_from_title(raw_title: str, link: str) -> dict:
-    title = re.sub(r"\s+", " ", raw_title or "").strip()
+    title = re.sub(r"\s+", " ", html.unescape(raw_title or "")).strip()
     title = re.sub(r"\s*\|\s*(Spotify|Apple Music|YouTube Music|Yandex Music|Яндекс Музыка)\s*$", "", title, flags=re.I)
     title = re.sub(r"\s*[-–—]\s*(Spotify|Apple Music|YouTube Music|Yandex Music|Яндекс Музыка)\s*$", "", title, flags=re.I)
 
@@ -880,10 +890,11 @@ def guess_release_from_title(raw_title: str, link: str) -> dict:
             artist, name = title.split(separator, 1)
             return {"artist": artist.strip(), "name": name.strip(), "genre": ""}
 
-    host = urlparse(link).hostname or ""
+    parsed = urlparse(link)
+    path_name = unquote(parsed.path.rstrip("/").split("/")[-1]).replace("-", " ").strip()
     return {
-        "artist": "Артист",
-        "name": title or host.replace("www.", "") or "Релиз",
+        "artist": "",
+        "name": title or path_name,
         "genre": "",
     }
 
@@ -893,13 +904,16 @@ def normalize_release_result(payload: dict, raw_title: str, link: str, detected_
     raw_genre = payload.get("genre", "") if isinstance(payload, dict) else ""
     genre = detected_genre or normalize_genre(raw_genre)
     return {
-        "artist": clean_ai_text(payload.get("artist") if isinstance(payload, dict) else "", guessed["artist"]),
-        "name": clean_ai_text(payload.get("name") if isinstance(payload, dict) else "", guessed["name"]),
+        "artist": clean_ai_text(payload.get("artist") if isinstance(payload, dict) else "", guessed["artist"], 120),
+        "name": clean_ai_text(payload.get("name") if isinstance(payload, dict) else "", guessed["name"], 160),
         "genre": genre,
     }
 
 
 def call_ai_extract_release(raw_title: str, link: str, detected_genre: str) -> dict:
+    if not raw_title.strip():
+        return normalize_release_result({}, raw_title, link, detected_genre)
+
     if not client_ai:
         return normalize_release_result({}, raw_title, link, detected_genre)
 
@@ -919,10 +933,11 @@ def call_ai_extract_release(raw_title: str, link: str, detected_genre: str) -> d
                                 "Extract a music release from the page title or URL. "
                                 "Return only compact JSON with string keys: artist, name"
                                 + (", genre" if not detected_genre else "")
-                                + f". Remove platform names, marketing words, and quotes.{prompt_suffix}"
+                                + ". Use only the provided page title. Do not invent missing data. "
+                                + f"Remove platform names, marketing words, and quotes.{prompt_suffix}"
                             ),
                         },
-                        {"role": "user", "content": raw_title or link},
+                        {"role": "user", "content": raw_title},
                     ],
                     response_format={"type": "json_object"},
                     temperature=0,
@@ -980,8 +995,12 @@ async def parse_link(req: LinkRequest, user: TelegramUser = Depends(require_admi
     yandex_result = await get_yandex_music_release(req.link)
     if yandex_result:
         return yandex_result
+    if is_yandex_music_url(req.link):
+        raise HTTPException(502, "Could not fetch Yandex Music metadata")
 
     raw_title, found_image, raw_genre = await get_metadata_from_page(req.link)
+    if not raw_title:
+        raise HTTPException(422, "Could not read release metadata from link")
 
     detected_genre = normalize_genre(raw_genre)
     result = await ai_extract_release(raw_title, req.link, detected_genre)

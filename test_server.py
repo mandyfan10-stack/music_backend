@@ -407,6 +407,10 @@ def test_parse_yandex_music_url_extracts_album_and_track_ids(clean_env):
         "album_id": "123",
         "track_id": "456",
     }
+    assert server.parse_yandex_music_url("https://music.yandex.ru/album/123?track=789") == {
+        "album_id": "123",
+        "track_id": "789",
+    }
 
 
 def test_yandex_album_to_release_uses_real_metadata(clean_env):
@@ -487,6 +491,29 @@ async def test_parse_link_prefers_yandex_api_metadata(clean_env):
 
 
 @pytest.mark.asyncio
+async def test_parse_link_rejects_yandex_when_api_metadata_missing(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.is_safe_public_url = lambda url: True
+    server.get_yandex_music_release = AsyncMock(return_value=None)
+    server.get_metadata_from_page = AsyncMock()
+    server.ai_extract_release = AsyncMock()
+
+    admin = server.TelegramUser(user_id=1, username="admin", first_name="Admin", is_admin=True)
+    with pytest.raises(HTTPException) as exc_info:
+        await server.parse_link(server.LinkRequest(link="https://music.yandex.ru/album/123"), admin)
+
+    assert exc_info.value.status_code == 502
+    server.get_metadata_from_page.assert_not_called()
+    server.ai_extract_release.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_ai_extract_release_fallback_parses_common_title(clean_env):
     os.environ["ENV"] = "test"
     os.environ["MONGO_URL"] = "mongodb://localhost"
@@ -504,6 +531,28 @@ async def test_ai_extract_release_fallback_parses_common_title(clean_env):
     )
 
     assert result == {"artist": "Artist Name", "name": "Album Name", "genre": ""}
+
+
+@pytest.mark.asyncio
+async def test_parse_link_rejects_missing_page_metadata(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.is_safe_public_url = lambda url: True
+    server.get_yandex_music_release = AsyncMock(return_value=None)
+    server.get_metadata_from_page = AsyncMock(return_value=("", "", ""))
+    server.ai_extract_release = AsyncMock()
+
+    admin = server.TelegramUser(user_id=1, username="admin", first_name="Admin", is_admin=True)
+    with pytest.raises(HTTPException) as exc_info:
+        await server.parse_link(server.LinkRequest(link="https://example.com/unknown"), admin)
+
+    assert exc_info.value.status_code == 422
+    server.ai_extract_release.assert_not_called()
 
 
 def test_parse_ai_json_tolerates_wrapped_json(clean_env):
