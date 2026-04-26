@@ -395,6 +395,97 @@ def test_is_safe_public_url_rejects_credentials(clean_env):
     assert server.is_safe_public_url("https://user:pass@example.com/path") is False
 
 
+def test_parse_yandex_music_url_extracts_album_and_track_ids(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    assert server.parse_yandex_music_url("https://music.yandex.ru/album/123/track/456") == {
+        "album_id": "123",
+        "track_id": "456",
+    }
+
+
+def test_yandex_album_to_release_uses_real_metadata(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    result = server.yandex_album_to_release({
+        "title": "Альбом",
+        "artists": [{"name": "Первый"}, {"name": "Второй"}],
+        "labels": [{"name": "Label"}],
+        "coverUri": "avatars.yandex.net/get-music-content/1/cover/%%",
+        "genre": "rap",
+    })
+
+    assert result == {
+        "artist": "Первый, Второй",
+        "name": "Альбом",
+        "img": "https://avatars.yandex.net/get-music-content/1/cover/1000x1000",
+        "genre": "Рэп",
+    }
+
+
+def test_yandex_track_to_release_uses_album_cover_fallback(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    result = server.yandex_track_to_release({
+        "title": "Трек",
+        "artists": [{"name": "Исполнитель"}],
+        "albums": [{
+            "title": "Альбом",
+            "coverUri": "avatars.yandex.net/get-music-content/2/cover/%%",
+        }],
+    })
+
+    assert result == {
+        "artist": "Исполнитель",
+        "name": "Трек",
+        "img": "https://avatars.yandex.net/get-music-content/2/cover/1000x1000",
+        "genre": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_parse_link_prefers_yandex_api_metadata(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.is_safe_public_url = lambda url: True
+    server.get_yandex_music_release = AsyncMock(return_value={
+        "artist": "Исполнитель",
+        "name": "Альбом",
+        "img": "https://avatars.yandex.net/cover/1000x1000",
+        "genre": "Рэп",
+    })
+    server.get_metadata_from_page = AsyncMock()
+    server.ai_extract_release = AsyncMock()
+
+    admin = server.TelegramUser(user_id=1, username="admin", first_name="Admin", is_admin=True)
+    result = await server.parse_link(server.LinkRequest(link="https://music.yandex.ru/album/123"), admin)
+
+    assert result["artist"] == "Исполнитель"
+    assert result["img"] == "https://avatars.yandex.net/cover/1000x1000"
+    server.get_metadata_from_page.assert_not_called()
+    server.ai_extract_release.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_ai_extract_release_fallback_parses_common_title(clean_env):
     os.environ["ENV"] = "test"

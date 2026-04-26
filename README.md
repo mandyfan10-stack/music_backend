@@ -35,3 +35,5 @@ stored cursor to catch up on missed changes. The response includes:
 - `GROQ_MODEL_FALLBACKS`: Comma-separated list of fallback models.
 - `GROQ_MAX_RETRIES`: Number of retries for AI calls.
 - `GROQ_TIMEOUT`: AI request timeout in seconds (Default: 8).
+- `YANDEX_MUSIC_API_BASE`: Yandex Music API base URL (Default: `https://api.music.yandex.net`).
+- `YANDEX_COVER_SIZE`: Cover size used for Yandex Music `coverUri` templates (Default: `1000x1000`).

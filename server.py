@@ -112,6 +112,8 @@ GROQ_MODEL_FALLBACKS = [
 GROQ_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "2"))
 GROQ_TIMEOUT = float(os.getenv("GROQ_TIMEOUT", "8"))
 client_ai = Groq(api_key=GROQ_API_KEY, timeout=GROQ_TIMEOUT, max_retries=0) if GROQ_API_KEY and Groq is not None else None
+YANDEX_MUSIC_API_BASE = os.getenv("YANDEX_MUSIC_API_BASE", "https://api.music.yandex.net").rstrip("/")
+YANDEX_COVER_SIZE = os.getenv("YANDEX_COVER_SIZE", "1000x1000")
 
 
 def now_ms() -> float:
@@ -646,6 +648,88 @@ async def delete_all_reviews_by_author(username: str, admin: TelegramUser = Depe
 # ============================
 # ПАРСЕР ССЫЛОК
 # ============================
+def parse_yandex_music_url(url: str) -> dict:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in {"music.yandex.ru", "music.yandex.com"}:
+        return {}
+
+    parts = [part for part in parsed.path.split("/") if part]
+    result = {}
+    for index, part in enumerate(parts):
+        if part in {"album", "track"} and index + 1 < len(parts):
+            value = parts[index + 1]
+            if value.isdigit():
+                result[f"{part}_id"] = value
+    return result
+
+
+def yandex_cover_url(cover_uri: str) -> str:
+    if not cover_uri:
+        return ""
+    uri = cover_uri.replace("%%", YANDEX_COVER_SIZE)
+    if uri.startswith("//"):
+        return f"https:{uri}"
+    if uri.startswith(("http://", "https://")):
+        return uri
+    return f"https://{uri}"
+
+
+def join_yandex_names(items: list[dict]) -> str:
+    names = [item.get("name", "").strip() for item in items or [] if isinstance(item, dict) and item.get("name")]
+    return ", ".join(dict.fromkeys(names))
+
+
+def normalize_yandex_release_result(name: str, artist: str, img: str, genre: str = "") -> dict:
+    return {
+        "artist": clean_ai_text(artist, "Артист"),
+        "name": clean_ai_text(name, "Релиз"),
+        "img": img,
+        "genre": normalize_genre(genre),
+    }
+
+
+def yandex_album_to_release(album: dict) -> dict:
+    artist = join_yandex_names(album.get("artists")) or join_yandex_names(album.get("labels"))
+    img = yandex_cover_url(album.get("coverUri") or album.get("ogImage") or album.get("cover", {}).get("uri", ""))
+    genre = album.get("genre") or ""
+    return normalize_yandex_release_result(album.get("title", ""), artist, img, genre)
+
+
+def yandex_track_to_release(track: dict) -> dict:
+    album = (track.get("albums") or [{}])[0] if isinstance(track.get("albums"), list) else {}
+    artist = join_yandex_names(track.get("artists")) or join_yandex_names(album.get("artists")) or join_yandex_names(album.get("labels"))
+    img = yandex_cover_url(track.get("coverUri") or track.get("ogImage") or album.get("coverUri") or album.get("ogImage", ""))
+    genre = track.get("genre") or album.get("genre") or ""
+    return normalize_yandex_release_result(track.get("title", ""), artist, img, genre)
+
+
+async def get_yandex_music_release(url: str) -> Optional[dict]:
+    ids = parse_yandex_music_url(url)
+    if not ids:
+        return None
+
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(headers=headers, timeout=8.0, follow_redirects=False) as h_client:
+            if ids.get("track_id"):
+                res = await h_client.get(f"{YANDEX_MUSIC_API_BASE}/tracks/{ids['track_id']}")
+                res.raise_for_status()
+                payload = res.json().get("result") or []
+                if payload:
+                    return yandex_track_to_release(payload[0])
+
+            if ids.get("album_id"):
+                res = await h_client.get(f"{YANDEX_MUSIC_API_BASE}/albums/{ids['album_id']}/with-tracks")
+                res.raise_for_status()
+                album = res.json().get("result") or {}
+                if album:
+                    return yandex_album_to_release(album)
+    except Exception as exc:
+        print(f"Yandex Music parser fallback used due to error: {exc}")
+    return None
+
+
 async def get_metadata_from_page(url: str):
     if not BeautifulSoup:
         return "", "", ""
@@ -892,6 +976,10 @@ async def parse_link(req: LinkRequest, user: TelegramUser = Depends(require_admi
     """Распознавание ссылки — только Создатель. Возвращает artist, name, img, genre."""
     if not is_safe_public_url(req.link):
         raise HTTPException(400, "Unsafe or unsupported URL")
+
+    yandex_result = await get_yandex_music_release(req.link)
+    if yandex_result:
+        return yandex_result
 
     raw_title, found_image, raw_genre = await get_metadata_from_page(req.link)
 
