@@ -34,3 +34,4 @@ stored cursor to catch up on missed changes. The response includes:
 - `GROQ_MODEL_PRIMARY`: Primary GROQ model (Default: `llama-3.3-70b-versatile`).
 - `GROQ_MODEL_FALLBACKS`: Comma-separated list of fallback models.
 - `GROQ_MAX_RETRIES`: Number of retries for AI calls.
+- `GROQ_TIMEOUT`: AI request timeout in seconds (Default: 8).

@@ -393,3 +393,96 @@ def test_is_safe_public_url_rejects_credentials(clean_env):
     importlib.reload(server)
 
     assert server.is_safe_public_url("https://user:pass@example.com/path") is False
+
+
+@pytest.mark.asyncio
+async def test_ai_extract_release_fallback_parses_common_title(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.client_ai = None
+
+    result = await server.ai_extract_release(
+        "Artist Name - Album Name | Spotify",
+        "https://open.spotify.com/album/123",
+        "",
+    )
+
+    assert result == {"artist": "Artist Name", "name": "Album Name", "genre": ""}
+
+
+def test_parse_ai_json_tolerates_wrapped_json(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    assert server.parse_ai_json('```json\n{"artist":"A","name":"B"}\n```') == {"artist": "A", "name": "B"}
+
+
+def test_normalize_release_result_sanitizes_ai_payload(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    result = server.normalize_release_result(
+        {"artist": "<b>A</b>", "name": "Track", "genre": "hip hop"},
+        "",
+        "https://example.com/release",
+        "",
+    )
+
+    assert result == {"artist": "&lt;b&gt;A&lt;/b&gt;", "name": "Track", "genre": "Хип-хоп"}
+
+
+def test_ai_fallback_sanitizes_title_guess(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    result = server.normalize_release_result(
+        {},
+        "<b>Artist</b> - <script>Album</script>",
+        "https://example.com/release",
+        "",
+    )
+
+    assert result["artist"] == "&lt;b&gt;Artist&lt;/b&gt;"
+    assert result["name"] == "&lt;script&gt;Album&lt;/script&gt;"
+
+
+@pytest.mark.asyncio
+async def test_parse_link_uses_async_ai_result(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.is_safe_public_url = lambda url: True
+    server.get_metadata_from_page = AsyncMock(return_value=("Artist - Album", "https://img.example/cover.jpg", "rap"))
+    server.ai_extract_release = AsyncMock(return_value={"artist": "Artist", "name": "Album", "genre": "Рэп"})
+
+    admin = server.TelegramUser(user_id=1, username="admin", first_name="Admin", is_admin=True)
+    result = await server.parse_link(server.LinkRequest(link="https://example.com/release"), admin)
+
+    assert result == {
+        "artist": "Artist",
+        "name": "Album",
+        "genre": "Рэп",
+        "img": "https://img.example/cover.jpg",
+    }
+    server.ai_extract_release.assert_awaited_once_with("Artist - Album", "https://example.com/release", "Рэп")

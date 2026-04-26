@@ -4,11 +4,13 @@ from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from pymongo.errors import DuplicateKeyError
 from collections import defaultdict
+import asyncio
 import os
 import html
 import hmac
 import hashlib
 import json
+import re
 import time
 import httpx
 import ipaddress
@@ -103,12 +105,13 @@ blocked_col = db["blocked_users"]
 sync_events_col = db["sync_events"]
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-client_ai = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY and Groq is not None else None
 GROQ_MODEL_PRIMARY = os.getenv("GROQ_MODEL_PRIMARY", "llama-3.3-70b-versatile")
 GROQ_MODEL_FALLBACKS = [
     m.strip() for m in os.getenv("GROQ_MODEL_FALLBACKS", "llama-3.1-8b-instant").split(",") if m.strip()
 ]
 GROQ_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "2"))
+GROQ_TIMEOUT = float(os.getenv("GROQ_TIMEOUT", "8"))
+client_ai = Groq(api_key=GROQ_API_KEY, timeout=GROQ_TIMEOUT, max_retries=0) if GROQ_API_KEY and Groq is not None else None
 
 
 def now_ms() -> float:
@@ -663,7 +666,10 @@ async def get_metadata_from_page(url: str):
                 return "", "", ""
 
             soup = BeautifulSoup(res.text, "html.parser")
-            title = str(soup.title.string) if soup.title and soup.title.string else ""
+            og_title = soup.find("meta", property="og:title")
+            title = str(og_title["content"]) if og_title and og_title.get("content") else ""
+            if not title:
+                title = str(soup.title.string) if soup.title and soup.title.string else ""
             img = ""
             genre = ""
 
@@ -706,7 +712,7 @@ async def get_metadata_from_page(url: str):
                 if og_desc and og_desc.get("content"):
                     desc = og_desc["content"]
                     # "Listen to X on Spotify. Genre · Year"
-                    parts = desc.split("·")
+                    parts = re.split(r"\s*[·•]\s*", desc)
                     if len(parts) >= 2:
                         candidate = parts[-1].strip().rstrip(".")
                         if len(candidate) < 30 and not candidate.isdigit():
@@ -747,9 +753,71 @@ def is_safe_public_url(url: str) -> bool:
         return False
 
 
-def ai_extract_release(raw_title: str, link: str, detected_genre: str) -> dict:
+def clean_ai_text(value, fallback: str, max_length: int = 120) -> str:
+    raw_value = value if isinstance(value, str) and value.strip() else fallback
+    cleaned = re.sub(r"\s+", " ", str(raw_value or "")).strip(" \t\r\n\"'`")
+    if not cleaned:
+        cleaned = str(fallback or "")
+    return html.escape(cleaned[:max_length])
+
+
+def parse_ai_json(content: str) -> dict:
+    if not isinstance(content, str):
+        return {}
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start < 0 or end <= start:
+            return {}
+        try:
+            parsed = json.loads(content[start:end + 1])
+        except json.JSONDecodeError:
+            return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def guess_release_from_title(raw_title: str, link: str) -> dict:
+    title = re.sub(r"\s+", " ", raw_title or "").strip()
+    title = re.sub(r"\s*\|\s*(Spotify|Apple Music|YouTube Music|Yandex Music|Яндекс Музыка)\s*$", "", title, flags=re.I)
+    title = re.sub(r"\s*[-–—]\s*(Spotify|Apple Music|YouTube Music|Yandex Music|Яндекс Музыка)\s*$", "", title, flags=re.I)
+
+    by_match = re.match(r"(?P<name>.+?)\s+by\s+(?P<artist>.+)$", title, flags=re.I)
+    if by_match:
+        return {
+            "artist": by_match.group("artist").strip(),
+            "name": by_match.group("name").strip(),
+            "genre": "",
+        }
+
+    for separator in (" - ", " – ", " — "):
+        if separator in title:
+            artist, name = title.split(separator, 1)
+            return {"artist": artist.strip(), "name": name.strip(), "genre": ""}
+
+    host = urlparse(link).hostname or ""
+    return {
+        "artist": "Артист",
+        "name": title or host.replace("www.", "") or "Релиз",
+        "genre": "",
+    }
+
+
+def normalize_release_result(payload: dict, raw_title: str, link: str, detected_genre: str) -> dict:
+    guessed = guess_release_from_title(raw_title, link)
+    raw_genre = payload.get("genre", "") if isinstance(payload, dict) else ""
+    genre = detected_genre or normalize_genre(raw_genre)
+    return {
+        "artist": clean_ai_text(payload.get("artist") if isinstance(payload, dict) else "", guessed["artist"]),
+        "name": clean_ai_text(payload.get("name") if isinstance(payload, dict) else "", guessed["name"]),
+        "genre": genre,
+    }
+
+
+def call_ai_extract_release(raw_title: str, link: str, detected_genre: str) -> dict:
     if not client_ai:
-        return {"artist": "Артист", "name": "Релиз", "genre": detected_genre}
+        return normalize_release_result({}, raw_title, link, detected_genre)
 
     models = [GROQ_MODEL_PRIMARY, *GROQ_MODEL_FALLBACKS]
     prompt_suffix = "" if detected_genre else " Also guess 'genre' from context."
@@ -764,22 +832,31 @@ def ai_extract_release(raw_title: str, link: str, detected_genre: str) -> dict:
                         {
                             "role": "system",
                             "content": (
-                                "Return JSON with keys: artist, name"
+                                "Extract a music release from the page title or URL. "
+                                "Return only compact JSON with string keys: artist, name"
                                 + (", genre" if not detected_genre else "")
-                                + f". Remove junk words.{prompt_suffix}"
+                                + f". Remove platform names, marketing words, and quotes.{prompt_suffix}"
                             ),
                         },
                         {"role": "user", "content": raw_title or link},
                     ],
                     response_format={"type": "json_object"},
+                    temperature=0,
+                    max_completion_tokens=160,
+                    timeout=GROQ_TIMEOUT,
                 )
-                return json.loads(chat.choices[0].message.content)
+                payload = parse_ai_json(chat.choices[0].message.content)
+                return normalize_release_result(payload, raw_title, link, detected_genre)
             except Exception as exc:
                 last_error = exc
                 continue
 
     print(f"AI parsing fallback used due to error: {last_error}")
-    return {"artist": "Артист", "name": "Релиз", "genre": detected_genre}
+    return normalize_release_result({}, raw_title, link, detected_genre)
+
+
+async def ai_extract_release(raw_title: str, link: str, detected_genre: str) -> dict:
+    return await asyncio.to_thread(call_ai_extract_release, raw_title, link, detected_genre)
 
 
 # Маппинг распространённых жанров на русский
@@ -819,7 +896,7 @@ async def parse_link(req: LinkRequest, user: TelegramUser = Depends(require_admi
     raw_title, found_image, raw_genre = await get_metadata_from_page(req.link)
 
     detected_genre = normalize_genre(raw_genre)
-    result = ai_extract_release(raw_title, req.link, detected_genre)
+    result = await ai_extract_release(raw_title, req.link, detected_genre)
     result["img"] = found_image
     if not detected_genre and result.get("genre"):
         detected_genre = normalize_genre(result["genre"])
