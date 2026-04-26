@@ -10,6 +10,16 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
+## Release Sync
+
+Clients can load the initial catalog with `GET /api/data`, then poll
+`GET /api/sync/releases?since=<cursor>` for fast incremental updates.
+Use the returned `cursor` value on the next request. The response includes:
+
+- `releases`: new or updated releases.
+- `deletedReleaseIds`: releases removed since the previous cursor.
+- `hasMore`: `true` when the client should immediately request the next page.
+
 ## Environment Variables
 
 - `MONGO_URL` (Required): MongoDB connection string.

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
@@ -100,6 +100,7 @@ releases_col = db["releases"]
 reviews_col = db["reviews"]
 likes_col = db["likes"]
 blocked_col = db["blocked_users"]
+sync_events_col = db["sync_events"]
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 client_ai = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY and Groq is not None else None
@@ -108,6 +109,14 @@ GROQ_MODEL_FALLBACKS = [
     m.strip() for m in os.getenv("GROQ_MODEL_FALLBACKS", "llama-3.1-8b-instant").split(",") if m.strip()
 ]
 GROQ_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "2"))
+
+
+def now_ms() -> float:
+    return time.time() * 1000
+
+
+def next_sync_token() -> int:
+    return time.time_ns()
 
 
 
@@ -341,12 +350,15 @@ async def check_not_blocked(user: TelegramUser = Depends(get_current_user)) -> T
 async def create_indexes():
     try:
         await releases_col.create_index("id", unique=True)
+        await releases_col.create_index("syncToken")
         await reviews_col.create_index("id", unique=True)
         await reviews_col.create_index("relId")
         await reviews_col.create_index("author")
         await reviews_col.create_index([("relId", 1), ("authorId", 1)], unique=True)
         await likes_col.create_index([("releaseId", 1), ("userId", 1)], unique=True)
         await blocked_col.create_index("username", unique=True)
+        await sync_events_col.create_index("syncToken")
+        await sync_events_col.create_index([("kind", 1), ("releaseId", 1)])
     except Exception as exc:
         print(f"Index warning: {exc}")
 
@@ -365,6 +377,19 @@ app.router.add_event_handler("shutdown", close_db_client)
 def clean_doc(doc: dict) -> dict:
     doc.pop("_id", None)
     return doc
+
+
+def get_release_sync_token(doc: dict) -> int:
+    return int(doc.get("syncToken") or doc.get("updatedAt") or doc.get("timestamp") or 0)
+
+
+async def record_release_sync_event(kind: str, release_id: str, sync_token: int):
+    await sync_events_col.insert_one({
+        "kind": kind,
+        "releaseId": release_id,
+        "syncToken": sync_token,
+        "timestamp": now_ms(),
+    })
 
 
 # ============================
@@ -424,23 +449,86 @@ async def get_all_data(request: Request):
     }
 
 
+@app.get("/api/sync/releases")
+async def sync_releases(
+    since: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """
+    Fast incremental release sync.
+    First call may use since=0; later calls should pass the returned cursor.
+    """
+    if since == 0:
+        releases = await releases_col.find().sort("syncToken", -1).to_list(length=limit)
+        for release in releases:
+            clean_doc(release)
+
+        cursor = max((get_release_sync_token(release) for release in releases), default=0)
+        return {
+            "cursor": cursor,
+            "serverTime": next_sync_token(),
+            "releases": releases,
+            "deletedReleaseIds": [],
+            "hasMore": False,
+        }
+
+    events = await sync_events_col.find({"syncToken": {"$gt": since}}).sort("syncToken", 1).to_list(length=limit)
+
+    changed_release_ids = []
+    deleted_release_ids = []
+    for event in events:
+        release_id = event.get("releaseId")
+        if not release_id:
+            continue
+
+        if event.get("kind") == "release_deleted":
+            deleted_release_ids.append(release_id)
+        elif event.get("kind") == "release_upserted":
+            changed_release_ids.append(release_id)
+
+    releases = []
+    if changed_release_ids:
+        unique_ids = list(dict.fromkeys(changed_release_ids))
+        releases = await releases_col.find({"id": {"$in": unique_ids}}).to_list(length=len(unique_ids))
+        releases.sort(key=get_release_sync_token)
+        for release in releases:
+            clean_doc(release)
+
+    cursor = max((int(event.get("syncToken") or since) for event in events), default=since)
+    return {
+        "cursor": cursor,
+        "serverTime": next_sync_token(),
+        "releases": releases,
+        "deletedReleaseIds": list(dict.fromkeys(deleted_release_ids)),
+        "hasMore": len(events) == limit,
+    }
+
+
 @app.post("/api/releases")
 async def add_release(rel: Release, user: TelegramUser = Depends(require_admin)):
     """Добавить релиз — только Создатель."""
     data = rel.model_dump()
+    sync_token = next_sync_token()
+    if data.get("timestamp", 0) <= 0:
+        data["timestamp"] = now_ms()
+    data["updatedAt"] = now_ms()
+    data["syncToken"] = sync_token
     data["createdBy"] = user.display_name
     data["createdById"] = user.user_id
     await releases_col.update_one({"id": rel.id}, {"$set": data}, upsert=True)
-    return {"status": "ok"}
+    await record_release_sync_event("release_upserted", rel.id, sync_token)
+    return {"status": "ok", "syncToken": sync_token}
 
 
 @app.delete("/api/releases/{rel_id}")
 async def delete_release(rel_id: str, user: TelegramUser = Depends(require_admin)):
     """Удалить релиз + связанные рецензии и лайки — только Создатель."""
+    sync_token = next_sync_token()
     await releases_col.delete_one({"id": rel_id})
     await reviews_col.delete_many({"relId": rel_id})
     await likes_col.delete_many({"releaseId": rel_id})
-    return {"status": "ok"}
+    await record_release_sync_event("release_deleted", rel_id, sync_token)
+    return {"status": "ok", "syncToken": sync_token}
 
 
 @app.post("/api/reviews")
