@@ -22,6 +22,10 @@ stored cursor to catch up on missed changes. The response includes:
 - `deletedReleaseIds`: releases removed since the previous cursor.
 - `hasMore`: `true` when the client should immediately request the next page.
 
+For near-instant updates without WebSockets, use long polling:
+`GET /api/sync/releases?since=<cursor>&waitMs=25000`. The request returns as
+soon as new release events are available, or empty after the wait timeout.
+
 ## Link Parsing
 
 Yandex Music links are parsed through the Yandex Music API first, including
@@ -44,3 +48,5 @@ data from an empty page or a URL alone.
 - `GROQ_TIMEOUT`: AI request timeout in seconds (Default: 8).
 - `YANDEX_MUSIC_API_BASE`: Yandex Music API base URL (Default: `https://api.music.yandex.net`).
 - `YANDEX_COVER_SIZE`: Cover size used for Yandex Music `coverUri` templates (Default: `1000x1000`).
+- `SYNC_POLL_INTERVAL_MS`: Server-side long-poll check interval (Default: 500).
+- `SYNC_MAX_WAIT_MS`: Maximum long-poll wait time in milliseconds (Default: 25000).

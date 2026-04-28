@@ -115,6 +115,8 @@ GROQ_TIMEOUT = float(os.getenv("GROQ_TIMEOUT", "8"))
 client_ai = Groq(api_key=GROQ_API_KEY, timeout=GROQ_TIMEOUT, max_retries=0) if GROQ_API_KEY and Groq is not None else None
 YANDEX_MUSIC_API_BASE = os.getenv("YANDEX_MUSIC_API_BASE", "https://api.music.yandex.net").rstrip("/")
 YANDEX_COVER_SIZE = os.getenv("YANDEX_COVER_SIZE", "1000x1000")
+SYNC_POLL_INTERVAL_MS = int(os.getenv("SYNC_POLL_INTERVAL_MS", "500"))
+SYNC_MAX_WAIT_MS = int(os.getenv("SYNC_MAX_WAIT_MS", "25000"))
 
 
 def now_ms() -> float:
@@ -356,12 +358,14 @@ async def check_not_blocked(user: TelegramUser = Depends(get_current_user)) -> T
 async def create_indexes():
     try:
         await releases_col.create_index("id", unique=True)
+        await releases_col.create_index("timestamp")
         await releases_col.create_index("syncToken")
         await reviews_col.create_index("id", unique=True)
         await reviews_col.create_index("relId")
         await reviews_col.create_index("author")
         await reviews_col.create_index([("relId", 1), ("authorId", 1)], unique=True)
         await likes_col.create_index([("releaseId", 1), ("userId", 1)], unique=True)
+        await likes_col.create_index("username")
         await blocked_col.create_index("username", unique=True)
         await sync_events_col.create_index("syncToken")
         await sync_events_col.create_index([("kind", 1), ("releaseId", 1)])
@@ -405,6 +409,27 @@ async def get_current_sync_cursor(releases: list[dict]) -> int:
     return max(release_cursor, event_cursor)
 
 
+async def get_release_sync_events(since: int, limit: int) -> list[dict]:
+    return await sync_events_col.find({"syncToken": {"$gt": since}}).sort("syncToken", 1).to_list(length=limit)
+
+
+async def wait_for_release_sync_events(since: int, limit: int, wait_ms: int) -> list[dict]:
+    max_wait_ms = min(wait_ms, SYNC_MAX_WAIT_MS)
+    deadline = time.monotonic() + (max_wait_ms / 1000)
+
+    while True:
+        events = await get_release_sync_events(since, limit)
+        if events or max_wait_ms <= 0:
+            return events
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return []
+
+        interval = max(SYNC_POLL_INTERVAL_MS, 50) / 1000
+        await asyncio.sleep(min(interval, remaining))
+
+
 # ============================
 # API ЭНДПОИНТЫ
 # ============================
@@ -414,8 +439,9 @@ async def get_all_data(request: Request):
     """Получение каталога. Авторизация опциональна (гости видят каталог)."""
     tg_user = await get_optional_user(request)
 
-    releases = await releases_col.find().sort("timestamp", -1).to_list(length=100)
-    all_reviews = await reviews_col.find().sort("timestamp", -1).to_list(length=500)
+    releases_task = releases_col.find().sort("timestamp", -1).to_list(length=100)
+    reviews_task = reviews_col.find().sort("timestamp", -1).to_list(length=500)
+    releases, all_reviews = await asyncio.gather(releases_task, reviews_task)
     sync_cursor = await get_current_sync_cursor(releases)
 
     for r in releases: clean_doc(r)
@@ -468,6 +494,7 @@ async def get_all_data(request: Request):
 async def sync_releases(
     since: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
+    waitMs: int = 0,
 ):
     """
     Fast incremental release sync.
@@ -487,7 +514,7 @@ async def sync_releases(
             "hasMore": False,
         }
 
-    events = await sync_events_col.find({"syncToken": {"$gt": since}}).sort("syncToken", 1).to_list(length=limit)
+    events = await wait_for_release_sync_events(since, limit, waitMs)
 
     changed_release_ids = []
     deleted_release_ids = []

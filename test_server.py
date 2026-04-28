@@ -1,6 +1,7 @@
 import pytest
 import os
 import importlib
+import asyncio
 from fastapi import HTTPException
 import hashlib
 import hmac
@@ -27,6 +28,12 @@ class FakeCursor:
         return self
 
     async def to_list(self, length):
+        return self.items[:length]
+
+
+class SlowFakeCursor(FakeCursor):
+    async def to_list(self, length):
+        await asyncio.sleep(0)
         return self.items[:length]
 
 
@@ -287,6 +294,61 @@ async def test_sync_releases_incremental_changes(clean_env):
     assert result["serverTime"] == 200
     assert result["deletedReleaseIds"] == ["rel-2"]
     assert result["releases"] == [{"id": "rel-1", "name": "Album", "syncToken": 101}]
+
+
+@pytest.mark.asyncio
+async def test_sync_releases_long_poll_waits_for_new_events(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    calls = {"count": 0}
+
+    def fake_event_find(query=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return SlowFakeCursor([])
+        return SlowFakeCursor([
+            {"kind": "release_upserted", "releaseId": "rel-1", "syncToken": 101},
+        ])
+
+    def fake_release_find(query=None):
+        assert query == {"id": {"$in": ["rel-1"]}}
+        return FakeCursor([{"id": "rel-1", "name": "Album", "syncToken": 101}])
+
+    server.SYNC_POLL_INTERVAL_MS = 1
+    server.sync_events_col.find = fake_event_find
+    server.releases_col.find = fake_release_find
+    server.next_sync_token = lambda: 200
+
+    result = await server.sync_releases(since=100, limit=100, waitMs=100)
+
+    assert calls["count"] == 2
+    assert result["cursor"] == 101
+    assert result["releases"] == [{"id": "rel-1", "name": "Album", "syncToken": 101}]
+
+
+@pytest.mark.asyncio
+async def test_sync_releases_long_poll_times_out_empty(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.SYNC_POLL_INTERVAL_MS = 1
+    server.sync_events_col.find = lambda query=None: SlowFakeCursor([])
+    server.next_sync_token = lambda: 200
+
+    result = await server.sync_releases(since=100, limit=100, waitMs=1)
+
+    assert result["cursor"] == 100
+    assert result["releases"] == []
+    assert result["deletedReleaseIds"] == []
 
 
 @pytest.mark.asyncio
