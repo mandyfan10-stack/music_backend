@@ -4,7 +4,9 @@ from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from pymongo.errors import DuplicateKeyError
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 import asyncio
+import logging
 import os
 import html
 import hmac
@@ -45,13 +47,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+logger = logging.getLogger("music_backend")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
+
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
     return response
 
 # ============================
@@ -117,6 +124,7 @@ YANDEX_MUSIC_API_BASE = os.getenv("YANDEX_MUSIC_API_BASE", "https://api.music.ya
 YANDEX_COVER_SIZE = os.getenv("YANDEX_COVER_SIZE", "1000x1000")
 SYNC_POLL_INTERVAL_MS = int(os.getenv("SYNC_POLL_INTERVAL_MS", "500"))
 SYNC_MAX_WAIT_MS = int(os.getenv("SYNC_MAX_WAIT_MS", "25000"))
+SYNC_EVENT_TTL_SECONDS = int(os.getenv("SYNC_EVENT_TTL_SECONDS", str(48 * 3600)))
 
 
 def now_ms() -> float:
@@ -127,6 +135,33 @@ def next_sync_token() -> int:
     return time.time_ns()
 
 
+def sync_event_expiry() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(seconds=SYNC_EVENT_TTL_SECONDS)
+
+
+
+def client_rate_key(request: Request) -> str:
+    """Stable per-user key for rate limiting.
+
+    Telegram initData carries the real user; behind a proxy request.client.host
+    is the proxy IP and would collapse every user into one bucket.
+    """
+    init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
+    if init_data:
+        parsed = parse_qs(init_data, keep_blank_values=True)
+        raw_user = parsed.get("user", [None])[0]
+        if raw_user:
+            try:
+                user_id = json.loads(raw_user).get("id")
+                if user_id:
+                    return f"user:{user_id}"
+            except Exception:
+                pass
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return f"ip:{forwarded.split(',')[0].strip()}"
+    return f"ip:{request.client.host if request.client else 'unknown'}"
+
 
 class RateLimiter:
     def __init__(self, requests_per_minute: int = 30):
@@ -134,12 +169,16 @@ class RateLimiter:
         self.clients = defaultdict(list)
 
     async def __call__(self, request: Request):
-        client_ip = request.client.host if request.client else "unknown"
+        key = client_rate_key(request)
         now = time.time()
-        self.clients[client_ip] = [t for t in self.clients[client_ip] if now - t < 60]
-        if len(self.clients[client_ip]) >= self.requests_per_minute:
+        # Drop stale timestamps and prune empty buckets to avoid unbounded growth.
+        for stale_key in [k for k, v in self.clients.items() if not v or now - v[-1] >= 60]:
+            if stale_key != key:
+                del self.clients[stale_key]
+        self.clients[key] = [t for t in self.clients[key] if now - t < 60]
+        if len(self.clients[key]) >= self.requests_per_minute:
             raise HTTPException(status_code=429, detail="Too many requests")
-        self.clients[client_ip].append(now)
+        self.clients[key].append(now)
 
 rate_limiter = RateLimiter(requests_per_minute=20)
 
@@ -147,6 +186,33 @@ rate_limiter = RateLimiter(requests_per_minute=20)
 # ============================
 # МОДЕЛИ
 # ============================
+# Фиксированный набор критериев оценки. Значения принудительно нормализуются на
+# сервере — клиентский rating/objectiveRating не используется (защита от накрутки).
+CRITERIA_KEYS = ("sound", "production", "originality", "meaning", "relevance", "image")
+
+
+def normalize_criteria(raw) -> dict:
+    """Возвращает dict только из известных ключей с int-значениями 1..10."""
+    source = raw if isinstance(raw, dict) else {}
+    result = {}
+    for key in CRITERIA_KEYS:
+        try:
+            value = int(float(source.get(key, 5)))
+        except (TypeError, ValueError):
+            value = 5
+        result[key] = max(1, min(10, value))
+    return result
+
+
+def compute_review_ratings(base_rating: int, criteria: dict) -> tuple[float, float]:
+    """Серверный пересчёт: objectiveRating — среднее критериев, rating — среднее с base."""
+    values = [criteria[key] for key in CRITERIA_KEYS]
+    objective = round(sum(values) / len(values), 1)
+    base = max(1, min(10, int(base_rating)))
+    final = round((objective + base) / 2, 1)
+    return objective, final
+
+
 class LinkRequest(BaseModel):
     link: str = Field(min_length=1)
 
@@ -159,13 +225,6 @@ class Release(BaseModel):
     genre: str = ""
     timestamp: float = 0
 
-    @field_validator("id", "name", "artist", "genre", mode="before")
-    @classmethod
-    def sanitize_strings(cls, v):
-        if isinstance(v, str):
-            return html.escape(v)
-        return v
-
     @field_validator("img", "link", mode="after")
     @classmethod
     def check_urls(cls, v):
@@ -177,30 +236,16 @@ class Review(BaseModel):
     id: str = Field(min_length=1)
     relId: str = Field(min_length=1)
     text: str = Field(min_length=30, max_length=3000)
-    rating: float = Field(ge=0, le=10)
     baseRating: int = Field(ge=1, le=10, default=5)
     criteria: dict = Field(default_factory=dict)
+    # rating / objectiveRating принимаются для совместимости, но пересчитываются на сервере.
+    rating: float = Field(ge=0, le=10, default=5.0)
     objectiveRating: float = Field(ge=0, le=10, default=5.0)
-
-    @field_validator("id", "relId", "text", mode="before")
-    @classmethod
-    def sanitize_strings(cls, v):
-        if isinstance(v, str):
-            return html.escape(v)
-        return v
 
     @field_validator("criteria", mode="before")
     @classmethod
-    def sanitize_criteria(cls, v):
-        def sanitize(obj):
-            if isinstance(obj, str):
-                return html.escape(obj)
-            elif isinstance(obj, dict):
-                return {sanitize(k): sanitize(val) for k, val in obj.items()}
-            elif isinstance(obj, list):
-                return [sanitize(item) for item in obj]
-            return obj
-        return sanitize(v)
+    def coerce_criteria(cls, v):
+        return normalize_criteria(v)
 
 class LikeReq(BaseModel):
     releaseId: str = Field(min_length=1)
@@ -210,13 +255,6 @@ class BlockReq(BaseModel):
     username: str = Field(min_length=1)
     blocked: bool
 
-    @field_validator("username", mode="before")
-    @classmethod
-    def sanitize_username(cls, v):
-        if isinstance(v, str):
-            return html.escape(v)
-        return v
-
 
 # ============================
 # АВТОРИЗАЦИЯ ПО TELEGRAM initData
@@ -225,8 +263,8 @@ class TelegramUser:
     """Авторизованный пользователь из Telegram initData"""
     def __init__(self, user_id: int, username: str, first_name: str, is_admin: bool):
         self.user_id = user_id
-        self.username = html.escape(username) if username else ""  # без @, lowercase
-        self.first_name = html.escape(first_name) if first_name else ""
+        self.username = username or ""  # без @, lowercase
+        self.first_name = first_name or ""
         self.is_admin = is_admin
         self.display_name = f"@{self.username}" if self.username else self.first_name or f"user-{self.user_id}"
 
@@ -251,7 +289,7 @@ def validate_telegram_init_data(init_data: str) -> dict:
     if not TELEGRAM_BOT_TOKEN:
         if not DEV_MODE:
             raise HTTPException(500, "Server configuration error: TELEGRAM_BOT_TOKEN is not set")
-        print("⚠️  DEV MODE: Telegram signature NOT verified (set TELEGRAM_BOT_TOKEN for production)")
+        logger.warning("DEV MODE: Telegram signature NOT verified (set TELEGRAM_BOT_TOKEN for production)")
         return user_data
 
     # Полная криптопроверка
@@ -312,7 +350,7 @@ async def get_current_user(request: Request) -> TelegramUser:
         username = clean or "guest"
         first_name = dev_name
         user_id = int(hashlib.sha256(username.encode("utf-8")).hexdigest()[:15], 16) % 10**9
-        print(f"⚠️  DEV MODE user: {username}")
+        logger.warning("DEV MODE user: %s", username)
     else:
         raise HTTPException(401, "Authorization required: open from Telegram")
 
@@ -369,8 +407,9 @@ async def create_indexes():
         await blocked_col.create_index("username", unique=True)
         await sync_events_col.create_index("syncToken")
         await sync_events_col.create_index([("kind", 1), ("releaseId", 1)])
+        await sync_events_col.create_index("expireAt", expireAfterSeconds=0)
     except Exception as exc:
-        print(f"Index warning: {exc}")
+        logger.warning("Index warning: %s", exc)
 
 
 def close_db_client():
@@ -399,6 +438,7 @@ async def record_release_sync_event(kind: str, release_id: str, sync_token: int)
         "releaseId": release_id,
         "syncToken": sync_token,
         "timestamp": now_ms(),
+        "expireAt": sync_event_expiry(),
     })
 
 
@@ -445,7 +485,10 @@ async def get_all_data(request: Request):
     sync_cursor = await get_current_sync_cursor(releases)
 
     for r in releases: clean_doc(r)
-    for r in all_reviews: clean_doc(r)
+    for r in all_reviews:
+        clean_doc(r)
+        # Роль автора вычисляется на сервере — клиент больше не получает список админов.
+        r["authorIsAdmin"] = normalize_username(r.get("authorUsername", "")) in ADMIN_USERNAMES
 
     # Лайки текущего пользователя
     user_likes = []
@@ -595,9 +638,14 @@ async def add_review(rev: Review, user: TelegramUser = Depends(check_not_blocked
         raise HTTPException(409, "You already reviewed this release")
 
     data = rev.model_dump()
+    # Рейтинг считается на сервере из критериев — клиентские значения игнорируются.
+    objective, final = compute_review_ratings(data["baseRating"], data["criteria"])
+    data["objectiveRating"] = objective
+    data["rating"] = final
     data["author"] = user.display_name
     data["authorId"] = user.user_id
     data["authorUsername"] = user.username
+    data["authorIsAdmin"] = user.is_admin
     data["date"] = time.strftime("%d.%m.%Y")
     data["timestamp"] = time.time() * 1000
     try:
@@ -763,7 +811,7 @@ async def get_yandex_music_release(url: str) -> Optional[dict]:
                 if album:
                     return yandex_album_to_release(album)
     except Exception as exc:
-        print(f"Yandex Music parser fallback used due to error: {exc}")
+        logger.warning("Yandex Music parser fallback used due to error: %s", exc)
     return None
 
 
@@ -879,7 +927,7 @@ def clean_ai_text(value, fallback: str, max_length: int = 120) -> str:
     cleaned = re.sub(r"\s+", " ", str(raw_value or "")).strip(" \t\r\n\"'`")
     if not cleaned:
         cleaned = str(fallback or "")
-    return html.escape(cleaned[:max_length])
+    return cleaned[:max_length]
 
 
 def parse_ai_json(content: str) -> dict:
@@ -977,7 +1025,7 @@ def call_ai_extract_release(raw_title: str, link: str, detected_genre: str) -> d
                 last_error = exc
                 continue
 
-    print(f"AI parsing fallback used due to error: {last_error}")
+    logger.warning("AI parsing fallback used due to error: %s", last_error)
     return normalize_release_result({}, raw_title, link, detected_genre)
 
 

@@ -192,6 +192,7 @@ async def test_add_release_records_sync_event(clean_env):
     server.sync_events_col.insert_one = AsyncMock()
     server.next_sync_token = lambda: 123
     server.now_ms = lambda: 456.0
+    server.sync_event_expiry = lambda: "EXPIRY"
 
     admin = server.TelegramUser(user_id=1, username="admin", first_name="Admin", is_admin=True)
     rel = server.Release(id="rel-1", name="Album", artist="Artist", link="https://example.com/album")
@@ -209,6 +210,7 @@ async def test_add_release_records_sync_event(clean_env):
         "releaseId": "rel-1",
         "syncToken": 123,
         "timestamp": 456.0,
+        "expireAt": "EXPIRY",
     })
 
 
@@ -227,6 +229,7 @@ async def test_delete_release_records_sync_event(clean_env):
     server.sync_events_col.insert_one = AsyncMock()
     server.next_sync_token = lambda: 222
     server.now_ms = lambda: 333.0
+    server.sync_event_expiry = lambda: "EXPIRY"
 
     admin = server.TelegramUser(user_id=1, username="admin", first_name="Admin", is_admin=True)
     result = await server.delete_release("rel-1", admin)
@@ -240,6 +243,7 @@ async def test_delete_release_records_sync_event(clean_env):
         "releaseId": "rel-1",
         "syncToken": 222,
         "timestamp": 333.0,
+        "expireAt": "EXPIRY",
     })
 
 
@@ -628,7 +632,7 @@ def test_parse_ai_json_tolerates_wrapped_json(clean_env):
     assert server.parse_ai_json('```json\n{"artist":"A","name":"B"}\n```') == {"artist": "A", "name": "B"}
 
 
-def test_normalize_release_result_sanitizes_ai_payload(clean_env):
+def test_normalize_release_result_keeps_raw_ai_payload(clean_env):
     os.environ["ENV"] = "test"
     os.environ["MONGO_URL"] = "mongodb://localhost"
     os.environ["ADMIN_USERNAMES"] = "admin"
@@ -636,6 +640,7 @@ def test_normalize_release_result_sanitizes_ai_payload(clean_env):
     import server
     importlib.reload(server)
 
+    # Данные хранятся «сырыми»; экранирование выполняется только на выводе (фронтенд).
     result = server.normalize_release_result(
         {"artist": "<b>A</b>", "name": "Track", "genre": "hip hop"},
         "",
@@ -643,10 +648,10 @@ def test_normalize_release_result_sanitizes_ai_payload(clean_env):
         "",
     )
 
-    assert result == {"artist": "&lt;b&gt;A&lt;/b&gt;", "name": "Track", "genre": "Хип-хоп"}
+    assert result == {"artist": "<b>A</b>", "name": "Track", "genre": "Хип-хоп"}
 
 
-def test_ai_fallback_sanitizes_title_guess(clean_env):
+def test_ai_fallback_keeps_raw_title_guess(clean_env):
     os.environ["ENV"] = "test"
     os.environ["MONGO_URL"] = "mongodb://localhost"
     os.environ["ADMIN_USERNAMES"] = "admin"
@@ -661,8 +666,8 @@ def test_ai_fallback_sanitizes_title_guess(clean_env):
         "",
     )
 
-    assert result["artist"] == "&lt;b&gt;Artist&lt;/b&gt;"
-    assert result["name"] == "&lt;script&gt;Album&lt;/script&gt;"
+    assert result["artist"] == "<b>Artist</b>"
+    assert result["name"] == "<script>Album</script>"
 
 
 @pytest.mark.asyncio
@@ -688,3 +693,110 @@ async def test_parse_link_uses_async_ai_result(clean_env):
         "img": "https://img.example/cover.jpg",
     }
     server.ai_extract_release.assert_awaited_once_with("Artist - Album", "https://example.com/release", "Рэп")
+
+
+def test_normalize_criteria_clamps_and_fills(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    result = server.normalize_criteria({"sound": 99, "production": -3, "bogus": 7})
+
+    assert set(result.keys()) == set(server.CRITERIA_KEYS)
+    assert result["sound"] == 10       # clamped to max
+    assert result["production"] == 1   # clamped to min
+    assert result["originality"] == 5  # default for missing
+    assert "bogus" not in result
+
+
+def test_compute_review_ratings_is_server_authoritative(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    criteria = server.normalize_criteria({k: 5 for k in server.CRITERIA_KEYS})
+    objective, final = server.compute_review_ratings(10, criteria)
+
+    assert objective == 5.0
+    assert final == 7.5
+
+
+@pytest.mark.asyncio
+async def test_add_review_ignores_client_rating(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.releases_col.find_one = AsyncMock(return_value={"id": "1", "name": "Test"})
+    server.reviews_col.find_one = AsyncMock(return_value=None)
+    server.reviews_col.insert_one = AsyncMock()
+
+    user = server.TelegramUser(user_id=1, username="test", first_name="Test", is_admin=False)
+    # Клиент присылает накрученный rating=1.0 и objectiveRating=1.0 — сервер их игнорирует.
+    rev = server.Review(
+        id="1", relId="1", text="a" * 30, rating=1.0, baseRating=10,
+        criteria={k: 5 for k in server.CRITERIA_KEYS}, objectiveRating=1.0,
+    )
+
+    await server.add_review(rev, user)
+
+    stored = server.reviews_col.insert_one.await_args.args[0]
+    assert stored["objectiveRating"] == 5.0
+    assert stored["rating"] == 7.5
+    assert stored["authorIsAdmin"] is False
+
+
+def test_client_rate_key_prefers_telegram_user(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    init_data = urlencode({"user": json.dumps({"id": 555, "username": "u"})})
+    tg_request = SimpleNamespace(
+        headers={"X-Telegram-Init-Data": init_data, "X-Forwarded-For": "9.9.9.9"},
+        client=SimpleNamespace(host="10.0.0.1"),
+    )
+    assert server.client_rate_key(tg_request) == "user:555"
+
+    # Без initData — ключуем по первому IP из X-Forwarded-For.
+    ip_request = SimpleNamespace(
+        headers={"X-Forwarded-For": "1.2.3.4, 5.6.7.8"},
+        client=SimpleNamespace(host="10.0.0.1"),
+    )
+    assert server.client_rate_key(ip_request) == "ip:1.2.3.4"
+
+
+@pytest.mark.asyncio
+async def test_get_all_data_marks_admin_review_authors(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.releases_col.find = lambda query=None: FakeCursor([])
+    server.reviews_col.find = lambda query=None: FakeCursor([
+        {"id": "r1", "authorUsername": "admin", "text": "x"},
+        {"id": "r2", "authorUsername": "bob", "text": "y"},
+    ])
+    server.sync_events_col.find = lambda query=None: FakeCursor([])
+
+    result = await server.get_all_data(FakeRequest())
+
+    by_id = {r["id"]: r for r in result["reviews"]}
+    assert by_id["r1"]["authorIsAdmin"] is True
+    assert by_id["r2"]["authorIsAdmin"] is False
+    assert "adminUsernames" not in result
