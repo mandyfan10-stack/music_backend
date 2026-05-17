@@ -111,6 +111,7 @@ reviews_col = db["reviews"]
 likes_col = db["likes"]
 blocked_col = db["blocked_users"]
 sync_events_col = db["sync_events"]
+review_reactions_col = db["review_reactions"]
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL_PRIMARY = os.getenv("GROQ_MODEL_PRIMARY", "llama-3.3-70b-versatile")
@@ -250,6 +251,9 @@ class Review(BaseModel):
 class LikeReq(BaseModel):
     releaseId: str = Field(min_length=1)
     isLike: bool
+
+class ReactReq(BaseModel):
+    reacted: bool
 
 class BlockReq(BaseModel):
     username: str = Field(min_length=1)
@@ -408,6 +412,9 @@ async def create_indexes():
         await sync_events_col.create_index("syncToken")
         await sync_events_col.create_index([("kind", 1), ("releaseId", 1)])
         await sync_events_col.create_index("expireAt", expireAfterSeconds=0)
+        await review_reactions_col.create_index([("reviewId", 1), ("userId", 1)], unique=True)
+        await review_reactions_col.create_index("reviewId")
+        await review_reactions_col.create_index("userId")
     except Exception as exc:
         logger.warning("Index warning: %s", exc)
 
@@ -495,14 +502,21 @@ async def get_all_data(request: Request):
     releases, all_reviews = await asyncio.gather(releases_task, reviews_task)
     sync_cursor = await get_current_sync_cursor(releases)
 
+    reaction_agg = await review_reactions_col.aggregate([
+        {"$group": {"_id": "$reviewId", "count": {"$sum": 1}}}
+    ]).to_list(length=10000)
+    reaction_counts = {row["_id"]: row["count"] for row in reaction_agg}
+
     for r in releases: clean_doc(r)
     for r in all_reviews:
         clean_doc(r)
         # Роль автора вычисляется на сервере — клиент больше не получает список админов.
         r["authorIsAdmin"] = normalize_username(r.get("authorUsername", "")) in ADMIN_USERNAMES
+        r["reactionCount"] = reaction_counts.get(r.get("id"), 0)
 
     # Лайки текущего пользователя
     user_likes = []
+    my_reactions = []
     is_admin = False
     display_name = "Гость"
     username = ""
@@ -512,6 +526,9 @@ async def get_all_data(request: Request):
         display_name = tg_user.display_name
         username = tg_user.username
         is_admin = tg_user.is_admin
+
+        my_reaction_docs = await review_reactions_col.find({"userId": tg_user.user_id}).to_list(length=5000)
+        my_reactions = [doc["reviewId"] for doc in my_reaction_docs]
 
         if tg_user.username:
             likes = await likes_col.find({
@@ -532,6 +549,7 @@ async def get_all_data(request: Request):
         "releases": releases,
         "reviews": all_reviews,
         "likes": user_likes,
+        "myReactions": my_reactions,
         "currentUser": {
             "displayName": display_name,
             "username": username,
@@ -637,11 +655,15 @@ async def add_release(rel: Release, user: TelegramUser = Depends(require_admin))
 
 @app.delete("/api/releases/{rel_id}")
 async def delete_release(rel_id: str, user: TelegramUser = Depends(require_admin)):
-    """Удалить релиз + связанные рецензии и лайки — только Создатель."""
+    """Удалить релиз + связанные рецензии, лайки и реакции — только Создатель."""
     sync_token = next_sync_token()
+    doomed_reviews = await reviews_col.find({"relId": rel_id}).to_list(length=5000)
+    review_ids = [r.get("id") for r in doomed_reviews if r.get("id")]
     await releases_col.delete_one({"id": rel_id})
     await reviews_col.delete_many({"relId": rel_id})
     await likes_col.delete_many({"releaseId": rel_id})
+    if review_ids:
+        await review_reactions_col.delete_many({"reviewId": {"$in": review_ids}})
     await record_release_sync_event("release_deleted", rel_id, sync_token)
     return {"status": "ok", "syncToken": sync_token}
 
@@ -705,6 +727,7 @@ async def delete_review(review_id: str, user: TelegramUser = Depends(get_current
 
     sync_token = next_sync_token()
     await reviews_col.delete_one({"id": review_id})
+    await review_reactions_col.delete_many({"reviewId": review_id})
     await record_review_sync_event("review_deleted", review_id, review.get("relId", ""), sync_token)
     return {"status": "ok", "syncToken": sync_token}
 
@@ -731,6 +754,31 @@ async def toggle_like(req: LikeReq, user: TelegramUser = Depends(check_not_block
     return {"status": "ok"}
 
 
+@app.post("/api/reviews/{review_id}/react")
+async def react_to_review(
+    review_id: str,
+    req: ReactReq,
+    user: TelegramUser = Depends(check_not_blocked),
+    _=Depends(rate_limiter),
+):
+    """Реакция «полезно» на рецензию — toggle, только авторизованные и не заблокированные."""
+    review = await reviews_col.find_one({"id": review_id})
+    if not review:
+        raise HTTPException(404, "Review not found")
+
+    if req.reacted:
+        await review_reactions_col.update_one(
+            {"reviewId": review_id, "userId": user.user_id},
+            {"$set": {"reviewId": review_id, "userId": user.user_id, "username": user.username}},
+            upsert=True,
+        )
+    else:
+        await review_reactions_col.delete_one({"reviewId": review_id, "userId": user.user_id})
+
+    count = await review_reactions_col.count_documents({"reviewId": review_id})
+    return {"status": "ok", "reactionCount": count}
+
+
 @app.post("/api/block")
 async def block_user(req: BlockReq, admin: TelegramUser = Depends(require_admin)):
     """Заблокировать / разблокировать пользователя — только Создатель."""
@@ -754,7 +802,10 @@ async def delete_all_reviews_by_author(username: str, admin: TelegramUser = Depe
     target = normalize_username(username)
     # Собираем id заранее, чтобы разослать sync-события для real-time обновления.
     doomed = await reviews_col.find({"authorUsername": target}).to_list(length=1000)
+    review_ids = [r.get("id") for r in doomed if r.get("id")]
     result = await reviews_col.delete_many({"authorUsername": target})
+    if review_ids:
+        await review_reactions_col.delete_many({"reviewId": {"$in": review_ids}})
     for review in doomed:
         await record_review_sync_event(
             "review_deleted", review.get("id", ""), review.get("relId", ""), next_sync_token()

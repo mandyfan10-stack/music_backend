@@ -224,8 +224,10 @@ async def test_delete_release_records_sync_event(clean_env):
     importlib.reload(server)
 
     server.releases_col.delete_one = AsyncMock()
+    server.reviews_col.find = lambda query=None: FakeCursor([])
     server.reviews_col.delete_many = AsyncMock()
     server.likes_col.delete_many = AsyncMock()
+    server.review_reactions_col.delete_many = AsyncMock()
     server.sync_events_col.insert_one = AsyncMock()
     server.next_sync_token = lambda: 222
     server.now_ms = lambda: 333.0
@@ -371,6 +373,7 @@ async def test_get_all_data_returns_sync_cursor_for_resume(clean_env):
     server.sync_events_col.find = lambda query=None: FakeCursor([
         {"kind": "release_deleted", "releaseId": "rel-2", "syncToken": 150},
     ])
+    server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([])
 
     result = await server.get_all_data(FakeRequest())
 
@@ -796,13 +799,80 @@ async def test_get_all_data_marks_admin_review_authors(clean_env):
         {"id": "r2", "authorUsername": "bob", "text": "y"},
     ])
     server.sync_events_col.find = lambda query=None: FakeCursor([])
+    server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([{"_id": "r1", "count": 3}])
 
     result = await server.get_all_data(FakeRequest())
 
     by_id = {r["id"]: r for r in result["reviews"]}
     assert by_id["r1"]["authorIsAdmin"] is True
     assert by_id["r2"]["authorIsAdmin"] is False
+    assert by_id["r1"]["reactionCount"] == 3
+    assert by_id["r2"]["reactionCount"] == 0
     assert "adminUsernames" not in result
+
+
+@pytest.mark.asyncio
+async def test_react_to_review_adds_reaction(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.reviews_col.find_one = AsyncMock(return_value={"id": "rv-1"})
+    server.review_reactions_col.update_one = AsyncMock()
+    server.review_reactions_col.delete_one = AsyncMock()
+    server.review_reactions_col.count_documents = AsyncMock(return_value=4)
+
+    user = server.TelegramUser(user_id=7, username="fan", first_name="Fan", is_admin=False)
+    result = await server.react_to_review("rv-1", server.ReactReq(reacted=True), user)
+
+    assert result == {"status": "ok", "reactionCount": 4}
+    server.review_reactions_col.update_one.assert_awaited_once()
+    server.review_reactions_col.delete_one.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_react_to_review_removes_reaction(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.reviews_col.find_one = AsyncMock(return_value={"id": "rv-1"})
+    server.review_reactions_col.update_one = AsyncMock()
+    server.review_reactions_col.delete_one = AsyncMock()
+    server.review_reactions_col.count_documents = AsyncMock(return_value=0)
+
+    user = server.TelegramUser(user_id=7, username="fan", first_name="Fan", is_admin=False)
+    result = await server.react_to_review("rv-1", server.ReactReq(reacted=False), user)
+
+    assert result == {"status": "ok", "reactionCount": 0}
+    server.review_reactions_col.delete_one.assert_awaited_once()
+    server.review_reactions_col.update_one.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_react_to_review_missing_review(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.reviews_col.find_one = AsyncMock(return_value=None)
+    server.review_reactions_col.count_documents = AsyncMock()
+
+    user = server.TelegramUser(user_id=7, username="fan", first_name="Fan", is_admin=False)
+    with pytest.raises(HTTPException) as exc_info:
+        await server.react_to_review("missing", server.ReactReq(reacted=True), user)
+
+    assert exc_info.value.status_code == 404
+    server.review_reactions_col.count_documents.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -845,6 +915,7 @@ async def test_delete_review_records_review_sync_event(clean_env):
 
     server.reviews_col.find_one = AsyncMock(return_value={"id": "rv-1", "relId": "rel-1", "authorId": 1})
     server.reviews_col.delete_one = AsyncMock()
+    server.review_reactions_col.delete_many = AsyncMock()
     server.sync_events_col.insert_one = AsyncMock()
     server.next_sync_token = lambda: 888
 

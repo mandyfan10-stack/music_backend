@@ -32,6 +32,13 @@ For near-instant updates without WebSockets, use long polling:
 `GET /api/sync/releases?since=<cursor>&waitMs=25000`. The request returns as
 soon as new release events are available, or empty after the wait timeout.
 
+## Review Reactions
+
+Users can mark a review as helpful via `POST /api/reviews/{id}/react` with body
+`{"reacted": true|false}` (toggle). `GET /api/data` returns `reactionCount` on
+each review and a `myReactions` list of review ids the current user reacted to.
+Reactions are removed when their review or parent release is deleted.
+
 ## Link Parsing
 
 Yandex Music links are parsed through the Yandex Music API first, including
