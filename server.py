@@ -442,6 +442,17 @@ async def record_release_sync_event(kind: str, release_id: str, sync_token: int)
     })
 
 
+async def record_review_sync_event(kind: str, review_id: str, rel_id: str, sync_token: int):
+    await sync_events_col.insert_one({
+        "kind": kind,
+        "reviewId": review_id,
+        "relId": rel_id,
+        "syncToken": sync_token,
+        "timestamp": now_ms(),
+        "expireAt": sync_event_expiry(),
+    })
+
+
 async def get_current_sync_cursor(releases: list[dict]) -> int:
     release_cursor = max((get_release_sync_token(release) for release in releases), default=0)
     latest_events = await sync_events_col.find().sort("syncToken", -1).to_list(length=1)
@@ -554,6 +565,8 @@ async def sync_releases(
             "serverTime": next_sync_token(),
             "releases": releases,
             "deletedReleaseIds": [],
+            "reviews": [],
+            "deletedReviewIds": [],
             "hasMore": False,
         }
 
@@ -561,15 +574,22 @@ async def sync_releases(
 
     changed_release_ids = []
     deleted_release_ids = []
+    changed_review_ids = []
+    deleted_review_ids = []
     for event in events:
-        release_id = event.get("releaseId")
-        if not release_id:
-            continue
-
-        if event.get("kind") == "release_deleted":
-            deleted_release_ids.append(release_id)
-        elif event.get("kind") == "release_upserted":
-            changed_release_ids.append(release_id)
+        kind = event.get("kind")
+        if kind == "release_deleted":
+            if event.get("releaseId"):
+                deleted_release_ids.append(event["releaseId"])
+        elif kind == "release_upserted":
+            if event.get("releaseId"):
+                changed_release_ids.append(event["releaseId"])
+        elif kind == "review_deleted":
+            if event.get("reviewId"):
+                deleted_review_ids.append(event["reviewId"])
+        elif kind == "review_added":
+            if event.get("reviewId"):
+                changed_review_ids.append(event["reviewId"])
 
     releases = []
     if changed_release_ids:
@@ -579,12 +599,22 @@ async def sync_releases(
         for release in releases:
             clean_doc(release)
 
+    reviews = []
+    if changed_review_ids:
+        unique_review_ids = list(dict.fromkeys(changed_review_ids))
+        reviews = await reviews_col.find({"id": {"$in": unique_review_ids}}).to_list(length=len(unique_review_ids))
+        for review in reviews:
+            clean_doc(review)
+            review["authorIsAdmin"] = normalize_username(review.get("authorUsername", "")) in ADMIN_USERNAMES
+
     cursor = max((int(event.get("syncToken") or since) for event in events), default=since)
     return {
         "cursor": cursor,
         "serverTime": next_sync_token(),
         "releases": releases,
         "deletedReleaseIds": list(dict.fromkeys(deleted_release_ids)),
+        "reviews": reviews,
+        "deletedReviewIds": list(dict.fromkeys(deleted_review_ids)),
         "hasMore": len(events) == limit,
     }
 
@@ -648,11 +678,14 @@ async def add_review(rev: Review, user: TelegramUser = Depends(check_not_blocked
     data["authorIsAdmin"] = user.is_admin
     data["date"] = time.strftime("%d.%m.%Y")
     data["timestamp"] = time.time() * 1000
+    sync_token = next_sync_token()
+    data["syncToken"] = sync_token
     try:
         await reviews_col.insert_one(data)
     except DuplicateKeyError:
         raise HTTPException(status_code=409, detail="User already reviewed this release")
-    return {"status": "ok", "review": clean_doc(data)}
+    await record_review_sync_event("review_added", rev.id, rev.relId, sync_token)
+    return {"status": "ok", "review": clean_doc(data), "syncToken": sync_token}
 
 
 @app.delete("/api/reviews/{review_id}")
@@ -670,8 +703,10 @@ async def delete_review(review_id: str, user: TelegramUser = Depends(get_current
     if not is_owner and not user.is_admin:
         raise HTTPException(403, "You can only delete your own reviews")
 
+    sync_token = next_sync_token()
     await reviews_col.delete_one({"id": review_id})
-    return {"status": "ok"}
+    await record_review_sync_event("review_deleted", review_id, review.get("relId", ""), sync_token)
+    return {"status": "ok", "syncToken": sync_token}
 
 
 @app.post("/api/likes")
@@ -717,7 +752,13 @@ async def block_user(req: BlockReq, admin: TelegramUser = Depends(require_admin)
 async def delete_all_reviews_by_author(username: str, admin: TelegramUser = Depends(require_admin)):
     """Удалить все рецензии пользователя — только Создатель."""
     target = normalize_username(username)
+    # Собираем id заранее, чтобы разослать sync-события для real-time обновления.
+    doomed = await reviews_col.find({"authorUsername": target}).to_list(length=1000)
     result = await reviews_col.delete_many({"authorUsername": target})
+    for review in doomed:
+        await record_review_sync_event(
+            "review_deleted", review.get("id", ""), review.get("relId", ""), next_sync_token()
+        )
     return {"status": "ok", "deleted": result.deleted_count}
 
 

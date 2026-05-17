@@ -20,7 +20,13 @@ stored cursor to catch up on missed changes. The response includes:
 
 - `releases`: new or updated releases.
 - `deletedReleaseIds`: releases removed since the previous cursor.
+- `reviews`: new or updated reviews since the previous cursor.
+- `deletedReviewIds`: reviews removed since the previous cursor.
 - `hasMore`: `true` when the client should immediately request the next page.
+
+Review changes (`review_added` / `review_deleted`) flow through the same event
+stream, so a single `/api/sync/releases` poll keeps both the catalog and its
+reviews up to date in real time.
 
 For near-instant updates without WebSockets, use long polling:
 `GET /api/sync/releases?since=<cursor>&waitMs=25000`. The request returns as

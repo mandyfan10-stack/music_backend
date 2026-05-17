@@ -441,7 +441,9 @@ async def test_delete_all_reviews_by_author_normalizes_username(clean_env):
     import server
     importlib.reload(server)
 
+    server.reviews_col.find = lambda query=None: FakeCursor([])
     server.reviews_col.delete_many = AsyncMock(return_value=SimpleNamespace(deleted_count=2))
+    server.sync_events_col.insert_one = AsyncMock()
 
     admin = server.TelegramUser(user_id=1, username="admin", first_name="Admin", is_admin=True)
     result = await server.delete_all_reviews_by_author("@TargetUser", admin)
@@ -739,6 +741,7 @@ async def test_add_review_ignores_client_rating(clean_env):
     server.releases_col.find_one = AsyncMock(return_value={"id": "1", "name": "Test"})
     server.reviews_col.find_one = AsyncMock(return_value=None)
     server.reviews_col.insert_one = AsyncMock()
+    server.sync_events_col.insert_one = AsyncMock()
 
     user = server.TelegramUser(user_id=1, username="test", first_name="Test", is_admin=False)
     # Клиент присылает накрученный rating=1.0 и objectiveRating=1.0 — сервер их игнорирует.
@@ -800,3 +803,87 @@ async def test_get_all_data_marks_admin_review_authors(clean_env):
     assert by_id["r1"]["authorIsAdmin"] is True
     assert by_id["r2"]["authorIsAdmin"] is False
     assert "adminUsernames" not in result
+
+
+@pytest.mark.asyncio
+async def test_add_review_records_review_sync_event(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.releases_col.find_one = AsyncMock(return_value={"id": "rel-1", "name": "Test"})
+    server.reviews_col.find_one = AsyncMock(return_value=None)
+    server.reviews_col.insert_one = AsyncMock()
+    server.sync_events_col.insert_one = AsyncMock()
+    server.next_sync_token = lambda: 777
+
+    user = server.TelegramUser(user_id=1, username="test", first_name="Test", is_admin=False)
+    rev = server.Review(id="rv-1", relId="rel-1", text="a" * 30, baseRating=5,
+                        criteria={k: 5 for k in server.CRITERIA_KEYS})
+
+    result = await server.add_review(rev, user)
+
+    assert result["syncToken"] == 777
+    event = server.sync_events_col.insert_one.await_args.args[0]
+    assert event["kind"] == "review_added"
+    assert event["reviewId"] == "rv-1"
+    assert event["relId"] == "rel-1"
+    assert event["syncToken"] == 777
+
+
+@pytest.mark.asyncio
+async def test_delete_review_records_review_sync_event(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.reviews_col.find_one = AsyncMock(return_value={"id": "rv-1", "relId": "rel-1", "authorId": 1})
+    server.reviews_col.delete_one = AsyncMock()
+    server.sync_events_col.insert_one = AsyncMock()
+    server.next_sync_token = lambda: 888
+
+    user = server.TelegramUser(user_id=1, username="test", first_name="Test", is_admin=False)
+    result = await server.delete_review("rv-1", user)
+
+    assert result == {"status": "ok", "syncToken": 888}
+    event = server.sync_events_col.insert_one.await_args.args[0]
+    assert event["kind"] == "review_deleted"
+    assert event["reviewId"] == "rv-1"
+    assert event["relId"] == "rel-1"
+
+
+@pytest.mark.asyncio
+async def test_sync_releases_returns_review_changes(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    events = [
+        {"kind": "review_added", "reviewId": "rv-1", "relId": "rel-1", "syncToken": 301},
+        {"kind": "review_deleted", "reviewId": "rv-2", "relId": "rel-1", "syncToken": 302},
+    ]
+
+    def fake_review_find(query=None):
+        assert query == {"id": {"$in": ["rv-1"]}}
+        return FakeCursor([{"_id": "m", "id": "rv-1", "relId": "rel-1", "authorUsername": "admin"}])
+
+    server.sync_events_col.find = lambda query=None: FakeCursor(events)
+    server.reviews_col.find = fake_review_find
+    server.next_sync_token = lambda: 400
+
+    result = await server.sync_releases(since=300, limit=100)
+
+    assert result["cursor"] == 302
+    assert result["deletedReviewIds"] == ["rv-2"]
+    assert result["reviews"][0]["id"] == "rv-1"
+    assert result["reviews"][0]["authorIsAdmin"] is True
+    assert result["releases"] == []
