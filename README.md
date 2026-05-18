@@ -63,3 +63,18 @@ data from an empty page or a URL alone.
 - `YANDEX_COVER_SIZE`: Cover size used for Yandex Music `coverUri` templates (Default: `1000x1000`).
 - `SYNC_POLL_INTERVAL_MS`: Server-side long-poll check interval (Default: 500).
 - `SYNC_MAX_WAIT_MS`: Maximum long-poll wait time in milliseconds (Default: 25000).
+- `SYNC_EVENT_TTL_SECONDS`: TTL for `sync_events` documents in seconds (Default: 172800).
+- `MINI_APP_URL`: Deep link to the Mini App (e.g. `https://t.me/<bot>/<app>`). When set,
+  release push notifications include an "Open in app" inline button pointing at
+  `MINI_APP_URL?startapp=<release_id>`. If unset, notifications are sent without a button.
+
+## Release Push Notifications
+
+When a new release is added (`POST /api/releases` with an actual insert), the
+backend asynchronously messages every opted-in subscriber through the Telegram
+Bot API. Subscriptions live in the `notification_subscribers` collection and are
+toggled via `POST /api/notifications/subscribe` (`{ "enabled": bool }`). Users
+with no record are treated as subscribed (opt-out model); `/api/data` returns
+the current state in `currentUser.notificationsEnabled`. Subscribers who have
+blocked the bot (HTTP 403) are automatically disabled. Requires
+`TELEGRAM_BOT_TOKEN`.

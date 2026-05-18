@@ -188,7 +188,7 @@ async def test_add_release_records_sync_event(clean_env):
     import server
     importlib.reload(server)
 
-    server.releases_col.update_one = AsyncMock()
+    server.releases_col.update_one = AsyncMock(return_value=SimpleNamespace(upserted_id=None))
     server.sync_events_col.insert_one = AsyncMock()
     server.next_sync_token = lambda: 123
     server.now_ms = lambda: 456.0
@@ -759,6 +759,151 @@ async def test_add_review_ignores_client_rating(clean_env):
     assert stored["objectiveRating"] == 5.0
     assert stored["rating"] == 7.5
     assert stored["authorIsAdmin"] is False
+
+
+@pytest.mark.asyncio
+async def test_add_release_notifies_subscribers_on_insert(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.releases_col.update_one = AsyncMock(return_value=SimpleNamespace(upserted_id="new-id"))
+    server.sync_events_col.insert_one = AsyncMock()
+    server.send_release_notifications = AsyncMock()
+
+    admin = server.TelegramUser(user_id=1, username="admin", first_name="Admin", is_admin=True)
+    rel = server.Release(id="rel-1", name="Album", artist="Artist", link="https://example.com/album")
+
+    await server.add_release(rel, admin)
+    await asyncio.sleep(0)  # дать фоновой задаче запуститься
+
+    server.send_release_notifications.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_add_release_skips_notification_on_update(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    # upserted_id=None → это правка существующего релиза, рассылки быть не должно.
+    server.releases_col.update_one = AsyncMock(return_value=SimpleNamespace(upserted_id=None))
+    server.sync_events_col.insert_one = AsyncMock()
+    server.send_release_notifications = AsyncMock()
+
+    admin = server.TelegramUser(user_id=1, username="admin", first_name="Admin", is_admin=True)
+    rel = server.Release(id="rel-1", name="Album", artist="Artist", link="https://example.com/album")
+
+    await server.add_release(rel, admin)
+    await asyncio.sleep(0)
+
+    server.send_release_notifications.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_notifications_upserts_preference(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.notif_subscribers_col.update_one = AsyncMock()
+    server.now_ms = lambda: 999.0
+
+    user = server.TelegramUser(user_id=7, username="fan", first_name="Fan", is_admin=False)
+    result = await server.set_notifications(server.SubscribeReq(enabled=False), user)
+
+    assert result == {"status": "ok", "enabled": False}
+    server.notif_subscribers_col.update_one.assert_awaited_once()
+    args, kwargs = server.notif_subscribers_col.update_one.await_args
+    assert args[0] == {"userId": 7}
+    assert args[1]["$set"]["enabled"] is False
+    assert args[1]["$set"]["chatId"] == 7
+    assert kwargs["upsert"] is True
+
+
+@pytest.mark.asyncio
+async def test_send_release_notifications_messages_enabled_subscribers(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "test-token"
+
+    import server
+    importlib.reload(server)
+
+    server.notif_subscribers_col.find = lambda query=None: FakeCursor([
+        {"userId": 11, "chatId": 11, "enabled": True},
+        {"userId": 22, "chatId": 22, "enabled": True},
+    ])
+
+    sent = []
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None):
+            sent.append(json)
+            return SimpleNamespace(status_code=200)
+
+    server.httpx.AsyncClient = lambda *a, **k: FakeClient()
+
+    await server.send_release_notifications({"id": "rel-1", "artist": "A", "name": "B"})
+
+    assert len(sent) == 2
+    assert {msg["chat_id"] for msg in sent} == {11, 22}
+    assert all("A — B" in msg["text"] for msg in sent)
+
+
+@pytest.mark.asyncio
+async def test_send_release_notifications_noop_without_token(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+    if "TELEGRAM_BOT_TOKEN" in os.environ:
+        del os.environ["TELEGRAM_BOT_TOKEN"]
+
+    import server
+    importlib.reload(server)
+
+    def fail_find(query=None):
+        raise AssertionError("subscribers must not be queried without a bot token")
+
+    server.notif_subscribers_col.find = fail_find
+
+    # Не должно бросить исключение и не должно трогать БД.
+    await server.send_release_notifications({"id": "rel-1", "artist": "A", "name": "B"})
+
+
+@pytest.mark.asyncio
+async def test_get_all_data_includes_notifications_enabled(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.releases_col.find = lambda query=None: FakeCursor([])
+    server.reviews_col.find = lambda query=None: FakeCursor([])
+    server.sync_events_col.find = lambda query=None: FakeCursor([])
+    server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([])
+
+    result = await server.get_all_data(FakeRequest())
+
+    assert result["currentUser"]["notificationsEnabled"] is True
 
 
 def test_client_rate_key_prefers_telegram_user(clean_env):
