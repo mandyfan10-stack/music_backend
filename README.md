@@ -67,6 +67,15 @@ data from an empty page or a URL alone.
 - `MINI_APP_URL`: Deep link to the Mini App (e.g. `https://t.me/<bot>/<app>`). When set,
   release push notifications include an "Open in app" inline button pointing at
   `MINI_APP_URL?startapp=<release_id>`. If unset, notifications are sent without a button.
+- `DATA_RELEASES_LIMIT`: Default number of releases returned by `/api/data` (Default: 200).
+- `DATA_REVIEWS_LIMIT`: Default number of reviews returned by `/api/data` (Default: 1000).
+
+## Catalog Pagination
+
+`GET /api/data` accepts optional `releasesLimit` (1–1000) and `reviewsLimit`
+(1–5000) query parameters that override the env defaults above. The response
+includes `totalReleases` and `totalReviews` so clients can detect when the
+catalog is larger than the returned slice.
 
 ## Release Push Notifications
 

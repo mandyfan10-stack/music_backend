@@ -370,15 +370,19 @@ async def test_get_all_data_returns_sync_cursor_for_resume(clean_env):
         {"_id": "mongo-id", "id": "rel-1", "name": "Album", "syncToken": 100},
     ])
     server.reviews_col.find = lambda query=None: FakeCursor([])
+    server.releases_col.count_documents = AsyncMock(return_value=1)
+    server.reviews_col.count_documents = AsyncMock(return_value=0)
     server.sync_events_col.find = lambda query=None: FakeCursor([
         {"kind": "release_deleted", "releaseId": "rel-2", "syncToken": 150},
     ])
     server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([])
 
-    result = await server.get_all_data(FakeRequest())
+    result = await server.get_all_data(FakeRequest(), releasesLimit=100, reviewsLimit=500)
 
     assert result["syncCursor"] == 150
     assert result["releases"] == [{"id": "rel-1", "name": "Album", "syncToken": 100}]
+    assert result["totalReleases"] == 1
+    assert result["totalReviews"] == 0
 
 
 @pytest.mark.asyncio
@@ -898,10 +902,12 @@ async def test_get_all_data_includes_notifications_enabled(clean_env):
 
     server.releases_col.find = lambda query=None: FakeCursor([])
     server.reviews_col.find = lambda query=None: FakeCursor([])
+    server.releases_col.count_documents = AsyncMock(return_value=0)
+    server.reviews_col.count_documents = AsyncMock(return_value=0)
     server.sync_events_col.find = lambda query=None: FakeCursor([])
     server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([])
 
-    result = await server.get_all_data(FakeRequest())
+    result = await server.get_all_data(FakeRequest(), releasesLimit=100, reviewsLimit=500)
 
     assert result["currentUser"]["notificationsEnabled"] is True
 
@@ -943,10 +949,12 @@ async def test_get_all_data_marks_admin_review_authors(clean_env):
         {"id": "r1", "authorUsername": "admin", "text": "x"},
         {"id": "r2", "authorUsername": "bob", "text": "y"},
     ])
+    server.releases_col.count_documents = AsyncMock(return_value=0)
+    server.reviews_col.count_documents = AsyncMock(return_value=2)
     server.sync_events_col.find = lambda query=None: FakeCursor([])
     server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([{"_id": "r1", "count": 3}])
 
-    result = await server.get_all_data(FakeRequest())
+    result = await server.get_all_data(FakeRequest(), releasesLimit=100, reviewsLimit=500)
 
     by_id = {r["id"]: r for r in result["reviews"]}
     assert by_id["r1"]["authorIsAdmin"] is True
@@ -954,6 +962,35 @@ async def test_get_all_data_marks_admin_review_authors(clean_env):
     assert by_id["r1"]["reactionCount"] == 3
     assert by_id["r2"]["reactionCount"] == 0
     assert "adminUsernames" not in result
+
+
+@pytest.mark.asyncio
+async def test_get_all_data_respects_limit_params(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.releases_col.find = lambda query=None: FakeCursor([
+        {"id": "rel-1"}, {"id": "rel-2"}, {"id": "rel-3"},
+    ])
+    server.reviews_col.find = lambda query=None: FakeCursor([
+        {"id": "rv-1"}, {"id": "rv-2"},
+    ])
+    server.releases_col.count_documents = AsyncMock(return_value=3)
+    server.reviews_col.count_documents = AsyncMock(return_value=2)
+    server.sync_events_col.find = lambda query=None: FakeCursor([])
+    server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([])
+
+    result = await server.get_all_data(FakeRequest(), releasesLimit=1, reviewsLimit=1)
+
+    # Выборка обрезана лимитом, но totals отражают полный размер каталога.
+    assert len(result["releases"]) == 1
+    assert len(result["reviews"]) == 1
+    assert result["totalReleases"] == 3
+    assert result["totalReviews"] == 2
 
 
 @pytest.mark.asyncio
