@@ -152,23 +152,25 @@ def sync_event_expiry() -> datetime:
 def client_rate_key(request: Request) -> str:
     """Stable per-user key for rate limiting.
 
-    Telegram initData carries the real user; behind a proxy request.client.host
-    is the proxy IP and would collapse every user into one bucket.
+    The user id is trusted only when the initData signature is valid — an
+    unverified id from the header could be rotated per request to mint a fresh
+    bucket and bypass the limit entirely. The X-Forwarded-For header is
+    client-controlled on the left; only the right-most hop is appended by the
+    trusted proxy, so that is the single entry we can rely on for the IP key.
     """
     init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
     if init_data:
-        parsed = parse_qs(init_data, keep_blank_values=True)
-        raw_user = parsed.get("user", [None])[0]
-        if raw_user:
-            try:
-                user_id = json.loads(raw_user).get("id")
-                if user_id:
-                    return f"user:{user_id}"
-            except Exception:
-                pass
+        try:
+            user_id = validate_telegram_init_data(init_data).get("id")
+            if user_id:
+                return f"user:{user_id}"
+        except Exception:
+            pass
     forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
-        return f"ip:{forwarded.split(',')[0].strip()}"
+        hops = [p.strip() for p in forwarded.split(",") if p.strip()]
+        if hops:
+            return f"ip:{hops[-1]}"
     return f"ip:{request.client.host if request.client else 'unknown'}"
 
 
@@ -190,6 +192,17 @@ class RateLimiter:
         self.clients[key].append(now)
 
 rate_limiter = RateLimiter(requests_per_minute=20)
+
+
+# Strong refs to fire-and-forget tasks: without them asyncio may garbage-collect
+# a running task before it finishes.
+_background_tasks: set = set()
+
+
+def spawn_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 # ============================
@@ -234,12 +247,27 @@ class Release(BaseModel):
     genre: str = ""
     timestamp: float = 0
 
-    @field_validator("img", "link", mode="after")
+    @field_validator("link", mode="after")
     @classmethod
-    def check_urls(cls, v):
+    def check_link(cls, v):
         if v and not v.startswith(("http://", "https://")):
             raise ValueError("URL must start with http:// or https://")
         return v
+
+    @field_validator("img", mode="after")
+    @classmethod
+    def check_img(cls, v):
+        # Обложка — либо http(s)-ссылка, либо встроенный data:image (ручная
+        # загрузка с устройства). Размер base64 ограничен, чтобы не раздувать БД.
+        if not v:
+            return v
+        if v.startswith(("http://", "https://")):
+            return v
+        if v.startswith("data:image/"):
+            if len(v) > 3_000_000:
+                raise ValueError("Embedded image is too large")
+            return v
+        raise ValueError("img must be an http(s) URL or a data:image/ URI")
 
 class Review(BaseModel):
     id: str = Field(min_length=1)
@@ -472,13 +500,6 @@ async def record_review_sync_event(kind: str, review_id: str, rel_id: str, sync_
     })
 
 
-async def get_current_sync_cursor(releases: list[dict]) -> int:
-    release_cursor = max((get_release_sync_token(release) for release in releases), default=0)
-    latest_events = await sync_events_col.find().sort("syncToken", -1).to_list(length=1)
-    event_cursor = max((int(event.get("syncToken") or 0) for event in latest_events), default=0)
-    return max(release_cursor, event_cursor)
-
-
 async def get_release_sync_events(since: int, limit: int) -> list[dict]:
     return await sync_events_col.find({"syncToken": {"$gt": since}}).sort("syncToken", 1).to_list(length=limit)
 
@@ -579,14 +600,22 @@ async def get_all_data(
     releases_task = releases_col.find().sort("timestamp", -1).to_list(length=releasesLimit)
     reviews_task = reviews_col.find().sort("timestamp", -1).to_list(length=reviewsLimit)
     releases, all_reviews = await asyncio.gather(releases_task, reviews_task)
-    total_releases = await releases_col.count_documents({})
-    total_reviews = await reviews_col.count_documents({})
-    sync_cursor = await get_current_sync_cursor(releases)
 
-    reaction_agg = await review_reactions_col.aggregate([
-        {"$group": {"_id": "$reviewId", "count": {"$sum": 1}}}
-    ]).to_list(length=10000)
+    # Counts, reaction tallies and the sync cursor are independent — fetch them
+    # in parallel instead of four sequential round-trips.
+    total_releases, total_reviews, reaction_agg, latest_events = await asyncio.gather(
+        releases_col.estimated_document_count(),
+        reviews_col.estimated_document_count(),
+        review_reactions_col.aggregate(
+            [{"$group": {"_id": "$reviewId", "count": {"$sum": 1}}}]
+        ).to_list(length=10000),
+        sync_events_col.find().sort("syncToken", -1).to_list(length=1),
+    )
     reaction_counts = {row["_id"]: row["count"] for row in reaction_agg}
+
+    release_cursor = max((get_release_sync_token(r) for r in releases), default=0)
+    event_cursor = max((int(e.get("syncToken") or 0) for e in latest_events), default=0)
+    sync_cursor = max(release_cursor, event_cursor)
 
     for r in releases: clean_doc(r)
     for r in all_reviews:
@@ -634,6 +663,7 @@ async def get_all_data(
         "likes": user_likes,
         "myReactions": my_reactions,
         "currentUser": {
+            "userId": tg_user.user_id if tg_user else None,
             "displayName": display_name,
             "username": username,
             "isAdmin": is_admin,
@@ -739,7 +769,7 @@ async def add_release(rel: Release, user: TelegramUser = Depends(require_admin))
     # Уведомляем подписчиков только о действительно новом релизе (вставка),
     # а не о правке существующего. Рассылка идёт фоном.
     if result.upserted_id is not None:
-        asyncio.create_task(send_release_notifications(data))
+        spawn_background(send_release_notifications(data))
     return {"status": "ok", "syncToken": sync_token}
 
 
@@ -896,10 +926,18 @@ async def delete_all_reviews_by_author(username: str, admin: TelegramUser = Depe
     result = await reviews_col.delete_many({"authorUsername": target})
     if review_ids:
         await review_reactions_col.delete_many({"reviewId": {"$in": review_ids}})
-    for review in doomed:
-        await record_review_sync_event(
-            "review_deleted", review.get("id", ""), review.get("relId", ""), next_sync_token()
-        )
+    if doomed:
+        await sync_events_col.insert_many([
+            {
+                "kind": "review_deleted",
+                "reviewId": review.get("id", ""),
+                "relId": review.get("relId", ""),
+                "syncToken": next_sync_token(),
+                "timestamp": now_ms(),
+                "expireAt": sync_event_expiry(),
+            }
+            for review in doomed
+        ])
     return {"status": "ok", "deleted": result.deleted_count}
 
 
@@ -1075,29 +1113,33 @@ async def get_metadata_from_page(url: str):
 
 
 def is_safe_public_url(url: str) -> bool:
-    """Basic SSRF protection: allow only http(s) and public IP targets."""
+    """SSRF protection: allow only http(s), standard ports and globally
+    routable IP targets.
+
+    DNS is resolved here and again by httpx at request time, so a narrow
+    rebinding window remains; callers re-check every redirect hop and keep the
+    gap between this check and the request minimal.
+    """
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
             return False
         if parsed.username or parsed.password:
             return False
+        if parsed.port is not None and parsed.port not in (80, 443):
+            return False
         host = parsed.hostname
         if not host:
             return False
-        if host.lower() in {"localhost"}:
+        if host.lower() == "localhost":
             return False
-        addr_info = socket.getaddrinfo(host, None)
-        for info in addr_info:
+        for info in socket.getaddrinfo(host, None):
             ip = ipaddress.ip_address(info[4][0])
-            if any([
-                ip.is_private,
-                ip.is_loopback,
-                ip.is_link_local,
-                ip.is_multicast,
-                ip.is_reserved,
-                ip.is_unspecified,
-            ]):
+            # Unwrap IPv4-mapped IPv6 (::ffff:10.0.0.1) before classifying.
+            mapped = getattr(ip, "ipv4_mapped", None)
+            if mapped is not None:
+                ip = mapped
+            if not ip.is_global or ip.is_multicast:
                 return False
         return True
     except Exception:

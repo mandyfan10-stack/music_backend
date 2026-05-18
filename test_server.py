@@ -2,7 +2,9 @@ import pytest
 import os
 import importlib
 import asyncio
+import time
 from fastapi import HTTPException
+from pydantic import ValidationError
 import hashlib
 import hmac
 import json
@@ -370,8 +372,8 @@ async def test_get_all_data_returns_sync_cursor_for_resume(clean_env):
         {"_id": "mongo-id", "id": "rel-1", "name": "Album", "syncToken": 100},
     ])
     server.reviews_col.find = lambda query=None: FakeCursor([])
-    server.releases_col.count_documents = AsyncMock(return_value=1)
-    server.reviews_col.count_documents = AsyncMock(return_value=0)
+    server.releases_col.estimated_document_count = AsyncMock(return_value=1)
+    server.reviews_col.estimated_document_count = AsyncMock(return_value=0)
     server.sync_events_col.find = lambda query=None: FakeCursor([
         {"kind": "release_deleted", "releaseId": "rel-2", "syncToken": 150},
     ])
@@ -902,8 +904,8 @@ async def test_get_all_data_includes_notifications_enabled(clean_env):
 
     server.releases_col.find = lambda query=None: FakeCursor([])
     server.reviews_col.find = lambda query=None: FakeCursor([])
-    server.releases_col.count_documents = AsyncMock(return_value=0)
-    server.reviews_col.count_documents = AsyncMock(return_value=0)
+    server.releases_col.estimated_document_count = AsyncMock(return_value=0)
+    server.reviews_col.estimated_document_count = AsyncMock(return_value=0)
     server.sync_events_col.find = lambda query=None: FakeCursor([])
     server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([])
 
@@ -912,27 +914,47 @@ async def test_get_all_data_includes_notifications_enabled(clean_env):
     assert result["currentUser"]["notificationsEnabled"] is True
 
 
-def test_client_rate_key_prefers_telegram_user(clean_env):
-    os.environ["ENV"] = "test"
+def test_client_rate_key_uses_verified_user(clean_env):
+    os.environ["ENV"] = "production"
     os.environ["MONGO_URL"] = "mongodb://localhost"
     os.environ["ADMIN_USERNAMES"] = "admin"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+    os.environ["DEV_MODE"] = "false"
 
     import server
     importlib.reload(server)
 
-    init_data = urlencode({"user": json.dumps({"id": 555, "username": "u"})})
+    # Подписанная initData → ключ по проверенному user.id.
+    signed = _signed_init_data("token", {
+        "auth_date": str(int(time.time())),
+        "user": json.dumps({"id": 555, "username": "u"}, separators=(",", ":")),
+    })
     tg_request = SimpleNamespace(
-        headers={"X-Telegram-Init-Data": init_data, "X-Forwarded-For": "9.9.9.9"},
+        headers={"X-Telegram-Init-Data": signed, "X-Forwarded-For": "9.9.9.9"},
         client=SimpleNamespace(host="10.0.0.1"),
     )
     assert server.client_rate_key(tg_request) == "user:555"
 
-    # Без initData — ключуем по первому IP из X-Forwarded-For.
-    ip_request = SimpleNamespace(
-        headers={"X-Forwarded-For": "1.2.3.4, 5.6.7.8"},
+
+def test_client_rate_key_ignores_forged_init_data(clean_env):
+    os.environ["ENV"] = "production"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+    os.environ["DEV_MODE"] = "false"
+
+    import server
+    importlib.reload(server)
+
+    # Неподписанная (поддельная) initData не должна давать user-ключ — иначе
+    # лимит обходится сменой user.id на каждый запрос.
+    forged = urlencode({"user": json.dumps({"id": 999})})
+    forged_request = SimpleNamespace(
+        headers={"X-Telegram-Init-Data": forged, "X-Forwarded-For": "1.2.3.4, 5.6.7.8"},
         client=SimpleNamespace(host="10.0.0.1"),
     )
-    assert server.client_rate_key(ip_request) == "ip:1.2.3.4"
+    # X-Forwarded-For подделывается клиентом слева → доверяем только последнему хопу.
+    assert server.client_rate_key(forged_request) == "ip:5.6.7.8"
 
 
 @pytest.mark.asyncio
@@ -949,8 +971,8 @@ async def test_get_all_data_marks_admin_review_authors(clean_env):
         {"id": "r1", "authorUsername": "admin", "text": "x"},
         {"id": "r2", "authorUsername": "bob", "text": "y"},
     ])
-    server.releases_col.count_documents = AsyncMock(return_value=0)
-    server.reviews_col.count_documents = AsyncMock(return_value=2)
+    server.releases_col.estimated_document_count = AsyncMock(return_value=0)
+    server.reviews_col.estimated_document_count = AsyncMock(return_value=2)
     server.sync_events_col.find = lambda query=None: FakeCursor([])
     server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([{"_id": "r1", "count": 3}])
 
@@ -979,8 +1001,8 @@ async def test_get_all_data_respects_limit_params(clean_env):
     server.reviews_col.find = lambda query=None: FakeCursor([
         {"id": "rv-1"}, {"id": "rv-2"},
     ])
-    server.releases_col.count_documents = AsyncMock(return_value=3)
-    server.reviews_col.count_documents = AsyncMock(return_value=2)
+    server.releases_col.estimated_document_count = AsyncMock(return_value=3)
+    server.reviews_col.estimated_document_count = AsyncMock(return_value=2)
     server.sync_events_col.find = lambda query=None: FakeCursor([])
     server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([])
 
@@ -1140,3 +1162,76 @@ async def test_sync_releases_returns_review_changes(clean_env):
     assert result["reviews"][0]["id"] == "rv-1"
     assert result["reviews"][0]["authorIsAdmin"] is True
     assert result["releases"] == []
+
+
+def test_release_accepts_data_image_uri(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    # Ручная загрузка обложки шлёт data:image/... — он должен приниматься.
+    rel = server.Release(
+        id="r", name="N", artist="A", link="https://example.com/x",
+        img="data:image/png;base64,iVBORw0KGgo=",
+    )
+    assert rel.img.startswith("data:image/")
+
+
+def test_release_rejects_oversized_data_image(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    with pytest.raises(ValidationError):
+        server.Release(
+            id="r", name="N", artist="A", link="https://example.com/x",
+            img="data:image/png;base64," + "A" * 3_000_001,
+        )
+
+
+def test_release_rejects_non_http_non_data_img(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    with pytest.raises(ValidationError):
+        server.Release(
+            id="r", name="N", artist="A", link="https://example.com/x",
+            img="ftp://evil.example/x.png",
+        )
+
+
+def test_release_link_must_stay_http(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    # data: послабление применяется только к img, но не к link.
+    with pytest.raises(ValidationError):
+        server.Release(
+            id="r", name="N", artist="A",
+            link="data:image/png;base64,AAA",
+        )
+
+
+def test_is_safe_public_url_rejects_nonstandard_port(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    assert server.is_safe_public_url("http://example.com:8080/internal") is False
