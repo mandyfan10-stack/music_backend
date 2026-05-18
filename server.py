@@ -112,6 +112,7 @@ likes_col = db["likes"]
 blocked_col = db["blocked_users"]
 sync_events_col = db["sync_events"]
 review_reactions_col = db["review_reactions"]
+notif_subscribers_col = db["notification_subscribers"]
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL_PRIMARY = os.getenv("GROQ_MODEL_PRIMARY", "llama-3.3-70b-versatile")
@@ -126,6 +127,9 @@ YANDEX_COVER_SIZE = os.getenv("YANDEX_COVER_SIZE", "1000x1000")
 SYNC_POLL_INTERVAL_MS = int(os.getenv("SYNC_POLL_INTERVAL_MS", "500"))
 SYNC_MAX_WAIT_MS = int(os.getenv("SYNC_MAX_WAIT_MS", "25000"))
 SYNC_EVENT_TTL_SECONDS = int(os.getenv("SYNC_EVENT_TTL_SECONDS", str(48 * 3600)))
+# Глубокая ссылка на Mini App для кнопки в push-уведомлении (например
+# https://t.me/<bot>/<app>). Если не задана — уведомление шлётся без кнопки.
+MINI_APP_URL = os.getenv("MINI_APP_URL", "").strip()
 
 
 def now_ms() -> float:
@@ -258,6 +262,9 @@ class ReactReq(BaseModel):
 class BlockReq(BaseModel):
     username: str = Field(min_length=1)
     blocked: bool
+
+class SubscribeReq(BaseModel):
+    enabled: bool
 
 
 # ============================
@@ -415,6 +422,7 @@ async def create_indexes():
         await review_reactions_col.create_index([("reviewId", 1), ("userId", 1)], unique=True)
         await review_reactions_col.create_index("reviewId")
         await review_reactions_col.create_index("userId")
+        await notif_subscribers_col.create_index("userId", unique=True)
     except Exception as exc:
         logger.warning("Index warning: %s", exc)
 
@@ -489,6 +497,65 @@ async def wait_for_release_sync_events(since: int, limit: int, wait_ms: int) -> 
 
 
 # ============================
+# PUSH-УВЕДОМЛЕНИЯ О РЕЛИЗАХ
+# ============================
+async def is_notifications_enabled(user_id: int) -> bool:
+    """Подписан ли пользователь на push. Отсутствие записи = подписан (opt-out)."""
+    doc = await notif_subscribers_col.find_one({"userId": user_id})
+    return doc.get("enabled", True) if doc else True
+
+
+async def send_release_notifications(release: dict):
+    """Рассылает подписчикам уведомление о новом релизе через Telegram Bot API.
+
+    Запускается фоном и не должна влиять на ответ эндпоинта. Ошибки доставки
+    отдельным пользователям подавляются; заблокировавших бота (403) отписываем.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    subscribers = await notif_subscribers_col.find(
+        {"enabled": {"$ne": False}}
+    ).to_list(length=10000)
+    if not subscribers:
+        return
+
+    artist = (release.get("artist") or "").strip()
+    name = (release.get("name") or "").strip()
+    text = f"🎵 Новый релиз в XXII SOUND\n\n{artist} — {name}"
+
+    reply_markup = None
+    if MINI_APP_URL:
+        sep = "&" if "?" in MINI_APP_URL else "?"
+        deep_link = f"{MINI_APP_URL}{sep}startapp={release.get('id', '')}"
+        reply_markup = {
+            "inline_keyboard": [[{"text": "Открыть в приложении", "url": deep_link}]]
+        }
+
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for sub in subscribers:
+            chat_id = sub.get("chatId") or sub.get("userId")
+            if not chat_id:
+                continue
+            payload = {"chat_id": chat_id, "text": text}
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+            try:
+                resp = await client.post(api_url, json=payload)
+                if resp.status_code == 403:
+                    # Пользователь заблокировал бота — отписываем, чтобы не долбить.
+                    await notif_subscribers_col.update_one(
+                        {"userId": sub.get("userId")},
+                        {"$set": {"enabled": False, "updatedAt": now_ms()}},
+                    )
+            except Exception as exc:
+                logger.warning("Notification send failed for %s: %s", chat_id, exc)
+            # Бережёмся лимитов Telegram (~30 сообщений/сек).
+            await asyncio.sleep(0.05)
+
+
+# ============================
 # API ЭНДПОИНТЫ
 # ============================
 
@@ -521,11 +588,13 @@ async def get_all_data(request: Request):
     display_name = "Гость"
     username = ""
     is_blocked = False
+    notifications_enabled = True
 
     if tg_user:
         display_name = tg_user.display_name
         username = tg_user.username
         is_admin = tg_user.is_admin
+        notifications_enabled = await is_notifications_enabled(tg_user.user_id)
 
         my_reaction_docs = await review_reactions_col.find({"userId": tg_user.user_id}).to_list(length=5000)
         my_reactions = [doc["reviewId"] for doc in my_reaction_docs]
@@ -556,6 +625,7 @@ async def get_all_data(request: Request):
             "isAdmin": is_admin,
             "isBlocked": is_blocked,
             "isAuthenticated": tg_user is not None,
+            "notificationsEnabled": notifications_enabled,
         },
         "blockedUsers": blocked_list,
         "syncCursor": sync_cursor,
@@ -648,8 +718,12 @@ async def add_release(rel: Release, user: TelegramUser = Depends(require_admin))
     data["syncToken"] = sync_token
     data["createdBy"] = user.display_name
     data["createdById"] = user.user_id
-    await releases_col.update_one({"id": rel.id}, {"$set": data}, upsert=True)
+    result = await releases_col.update_one({"id": rel.id}, {"$set": data}, upsert=True)
     await record_release_sync_event("release_upserted", rel.id, sync_token)
+    # Уведомляем подписчиков только о действительно новом релизе (вставка),
+    # а не о правке существующего. Рассылка идёт фоном.
+    if result.upserted_id is not None:
+        asyncio.create_task(send_release_notifications(data))
     return {"status": "ok", "syncToken": sync_token}
 
 
@@ -1176,6 +1250,23 @@ async def parse_link(req: LinkRequest, user: TelegramUser = Depends(require_admi
         detected_genre = normalize_genre(result["genre"])
     result["genre"] = detected_genre
     return result
+
+
+@app.post("/api/notifications/subscribe")
+async def set_notifications(req: SubscribeReq, user: TelegramUser = Depends(get_current_user)):
+    """Включить/выключить push-уведомления о новых релизах для пользователя."""
+    await notif_subscribers_col.update_one(
+        {"userId": user.user_id},
+        {"$set": {
+            "userId": user.user_id,
+            "username": user.username,
+            "chatId": user.user_id,
+            "enabled": req.enabled,
+            "updatedAt": now_ms(),
+        }},
+        upsert=True,
+    )
+    return {"status": "ok", "enabled": req.enabled}
 
 
 @app.get("/api/health")
