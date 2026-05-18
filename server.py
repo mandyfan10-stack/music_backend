@@ -130,6 +130,10 @@ SYNC_EVENT_TTL_SECONDS = int(os.getenv("SYNC_EVENT_TTL_SECONDS", str(48 * 3600))
 # Глубокая ссылка на Mini App для кнопки в push-уведомлении (например
 # https://t.me/<bot>/<app>). Если не задана — уведомление шлётся без кнопки.
 MINI_APP_URL = os.getenv("MINI_APP_URL", "").strip()
+# Сколько релизов/рецензий отдаёт /api/data по умолчанию (можно переопределить
+# query-параметром в пределах жёсткого максимума).
+DATA_RELEASES_LIMIT = int(os.getenv("DATA_RELEASES_LIMIT", "200"))
+DATA_REVIEWS_LIMIT = int(os.getenv("DATA_REVIEWS_LIMIT", "1000"))
 
 
 def now_ms() -> float:
@@ -560,13 +564,23 @@ async def send_release_notifications(release: dict):
 # ============================
 
 @app.get("/api/data")
-async def get_all_data(request: Request):
-    """Получение каталога. Авторизация опциональна (гости видят каталог)."""
+async def get_all_data(
+    request: Request,
+    releasesLimit: int = Query(default=DATA_RELEASES_LIMIT, ge=1, le=1000),
+    reviewsLimit: int = Query(default=DATA_REVIEWS_LIMIT, ge=1, le=5000),
+):
+    """Получение каталога. Авторизация опциональна (гости видят каталог).
+
+    `releasesLimit`/`reviewsLimit` ограничивают размер выборки; `totalReleases`/
+    `totalReviews` в ответе позволяют клиенту понять, что каталог обрезан.
+    """
     tg_user = await get_optional_user(request)
 
-    releases_task = releases_col.find().sort("timestamp", -1).to_list(length=100)
-    reviews_task = reviews_col.find().sort("timestamp", -1).to_list(length=500)
+    releases_task = releases_col.find().sort("timestamp", -1).to_list(length=releasesLimit)
+    reviews_task = reviews_col.find().sort("timestamp", -1).to_list(length=reviewsLimit)
     releases, all_reviews = await asyncio.gather(releases_task, reviews_task)
+    total_releases = await releases_col.count_documents({})
+    total_reviews = await reviews_col.count_documents({})
     sync_cursor = await get_current_sync_cursor(releases)
 
     reaction_agg = await review_reactions_col.aggregate([
@@ -629,6 +643,8 @@ async def get_all_data(request: Request):
         },
         "blockedUsers": blocked_list,
         "syncCursor": sync_cursor,
+        "totalReleases": total_releases,
+        "totalReviews": total_reviews,
     }
 
 

@@ -21,8 +21,10 @@ API для Telegram Mini App «XXII SOUND»: каталог музыкальны
 
 ## API-эндпоинты
 
-- `GET /api/data` — полный каталог + `currentUser` (роль, блокировка,
-  `notificationsEnabled`) + `syncCursor`. Авторизация опциональна.
+- `GET /api/data` — каталог + `currentUser` (роль, блокировка,
+  `notificationsEnabled`) + `syncCursor`. Авторизация опциональна. Размер
+  выборки — `releasesLimit`/`reviewsLimit` (env-дефолты `DATA_RELEASES_LIMIT`/
+  `DATA_REVIEWS_LIMIT`); `totalReleases`/`totalReviews` показывают полный объём.
 - `GET /api/sync/releases?since=&waitMs=` — инкрементальная синхронизация
   через long-poll (события из коллекции `sync_events`).
 - `POST /api/releases`, `DELETE /api/releases/{id}` — релизы (только админ).
