@@ -113,6 +113,7 @@ blocked_col = db["blocked_users"]
 sync_events_col = db["sync_events"]
 review_reactions_col = db["review_reactions"]
 notif_subscribers_col = db["notification_subscribers"]
+comments_col = db["review_comments"]
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL_PRIMARY = os.getenv("GROQ_MODEL_PRIMARY", "llama-3.3-70b-versatile")
@@ -134,6 +135,7 @@ MINI_APP_URL = os.getenv("MINI_APP_URL", "").strip()
 # query-параметром в пределах жёсткого максимума).
 DATA_RELEASES_LIMIT = int(os.getenv("DATA_RELEASES_LIMIT", "200"))
 DATA_REVIEWS_LIMIT = int(os.getenv("DATA_REVIEWS_LIMIT", "1000"))
+DATA_COMMENTS_LIMIT = int(os.getenv("DATA_COMMENTS_LIMIT", "2000"))
 
 
 def now_ms() -> float:
@@ -298,6 +300,10 @@ class BlockReq(BaseModel):
 class SubscribeReq(BaseModel):
     enabled: bool
 
+class CommentReq(BaseModel):
+    id: str = Field(min_length=1)
+    text: str = Field(min_length=1, max_length=1000)
+
 
 # ============================
 # АВТОРИЗАЦИЯ ПО TELEGRAM initData
@@ -455,6 +461,9 @@ async def create_indexes():
         await review_reactions_col.create_index("reviewId")
         await review_reactions_col.create_index("userId")
         await notif_subscribers_col.create_index("userId", unique=True)
+        await comments_col.create_index("id", unique=True)
+        await comments_col.create_index("reviewId")
+        await comments_col.create_index("timestamp")
     except Exception as exc:
         logger.warning("Index warning: %s", exc)
 
@@ -492,6 +501,18 @@ async def record_release_sync_event(kind: str, release_id: str, sync_token: int)
 async def record_review_sync_event(kind: str, review_id: str, rel_id: str, sync_token: int):
     await sync_events_col.insert_one({
         "kind": kind,
+        "reviewId": review_id,
+        "relId": rel_id,
+        "syncToken": sync_token,
+        "timestamp": now_ms(),
+        "expireAt": sync_event_expiry(),
+    })
+
+
+async def record_comment_sync_event(kind: str, comment_id: str, review_id: str, rel_id: str, sync_token: int):
+    await sync_events_col.insert_one({
+        "kind": kind,
+        "commentId": comment_id,
         "reviewId": review_id,
         "relId": rel_id,
         "syncToken": sync_token,
@@ -589,23 +610,29 @@ async def get_all_data(
     request: Request,
     releasesLimit: int = Query(default=DATA_RELEASES_LIMIT, ge=1, le=1000),
     reviewsLimit: int = Query(default=DATA_REVIEWS_LIMIT, ge=1, le=5000),
+    commentsLimit: int = Query(default=DATA_COMMENTS_LIMIT, ge=1, le=10000),
 ):
     """Получение каталога. Авторизация опциональна (гости видят каталог).
 
-    `releasesLimit`/`reviewsLimit` ограничивают размер выборки; `totalReleases`/
-    `totalReviews` в ответе позволяют клиенту понять, что каталог обрезан.
+    `releasesLimit`/`reviewsLimit`/`commentsLimit` ограничивают размер выборки;
+    `totalReleases`/`totalReviews`/`totalComments` в ответе позволяют клиенту
+    понять, что каталог обрезан.
     """
     tg_user = await get_optional_user(request)
 
     releases_task = releases_col.find().sort("timestamp", -1).to_list(length=releasesLimit)
     reviews_task = reviews_col.find().sort("timestamp", -1).to_list(length=reviewsLimit)
-    releases, all_reviews = await asyncio.gather(releases_task, reviews_task)
+    comments_task = comments_col.find().sort("timestamp", -1).to_list(length=commentsLimit)
+    releases, all_reviews, all_comments = await asyncio.gather(
+        releases_task, reviews_task, comments_task
+    )
 
     # Counts, reaction tallies and the sync cursor are independent — fetch them
-    # in parallel instead of four sequential round-trips.
-    total_releases, total_reviews, reaction_agg, latest_events = await asyncio.gather(
+    # in parallel instead of sequential round-trips.
+    total_releases, total_reviews, total_comments, reaction_agg, latest_events = await asyncio.gather(
         releases_col.estimated_document_count(),
         reviews_col.estimated_document_count(),
+        comments_col.estimated_document_count(),
         review_reactions_col.aggregate(
             [{"$group": {"_id": "$reviewId", "count": {"$sum": 1}}}]
         ).to_list(length=10000),
@@ -623,6 +650,9 @@ async def get_all_data(
         # Роль автора вычисляется на сервере — клиент больше не получает список админов.
         r["authorIsAdmin"] = normalize_username(r.get("authorUsername", "")) in ADMIN_USERNAMES
         r["reactionCount"] = reaction_counts.get(r.get("id"), 0)
+    for c in all_comments:
+        clean_doc(c)
+        c["authorIsAdmin"] = normalize_username(c.get("authorUsername", "")) in ADMIN_USERNAMES
 
     # Лайки текущего пользователя
     user_likes = []
@@ -660,6 +690,7 @@ async def get_all_data(
     return {
         "releases": releases,
         "reviews": all_reviews,
+        "comments": all_comments,
         "likes": user_likes,
         "myReactions": my_reactions,
         "currentUser": {
@@ -675,6 +706,7 @@ async def get_all_data(
         "syncCursor": sync_cursor,
         "totalReleases": total_releases,
         "totalReviews": total_reviews,
+        "totalComments": total_comments,
     }
 
 
@@ -701,6 +733,8 @@ async def sync_releases(
             "deletedReleaseIds": [],
             "reviews": [],
             "deletedReviewIds": [],
+            "comments": [],
+            "deletedCommentIds": [],
             "hasMore": False,
         }
 
@@ -710,6 +744,8 @@ async def sync_releases(
     deleted_release_ids = []
     changed_review_ids = []
     deleted_review_ids = []
+    changed_comment_ids = []
+    deleted_comment_ids = []
     for event in events:
         kind = event.get("kind")
         if kind == "release_deleted":
@@ -724,6 +760,12 @@ async def sync_releases(
         elif kind == "review_added":
             if event.get("reviewId"):
                 changed_review_ids.append(event["reviewId"])
+        elif kind == "comment_deleted":
+            if event.get("commentId"):
+                deleted_comment_ids.append(event["commentId"])
+        elif kind == "comment_added":
+            if event.get("commentId"):
+                changed_comment_ids.append(event["commentId"])
 
     releases = []
     if changed_release_ids:
@@ -741,6 +783,14 @@ async def sync_releases(
             clean_doc(review)
             review["authorIsAdmin"] = normalize_username(review.get("authorUsername", "")) in ADMIN_USERNAMES
 
+    comments = []
+    if changed_comment_ids:
+        unique_comment_ids = list(dict.fromkeys(changed_comment_ids))
+        comments = await comments_col.find({"id": {"$in": unique_comment_ids}}).to_list(length=len(unique_comment_ids))
+        for comment in comments:
+            clean_doc(comment)
+            comment["authorIsAdmin"] = normalize_username(comment.get("authorUsername", "")) in ADMIN_USERNAMES
+
     cursor = max((int(event.get("syncToken") or since) for event in events), default=since)
     return {
         "cursor": cursor,
@@ -749,6 +799,8 @@ async def sync_releases(
         "deletedReleaseIds": list(dict.fromkeys(deleted_release_ids)),
         "reviews": reviews,
         "deletedReviewIds": list(dict.fromkeys(deleted_review_ids)),
+        "comments": comments,
+        "deletedCommentIds": list(dict.fromkeys(deleted_comment_ids)),
         "hasMore": len(events) == limit,
     }
 
@@ -784,6 +836,7 @@ async def delete_release(rel_id: str, user: TelegramUser = Depends(require_admin
     await likes_col.delete_many({"releaseId": rel_id})
     if review_ids:
         await review_reactions_col.delete_many({"reviewId": {"$in": review_ids}})
+        await comments_col.delete_many({"reviewId": {"$in": review_ids}})
     await record_release_sync_event("release_deleted", rel_id, sync_token)
     return {"status": "ok", "syncToken": sync_token}
 
@@ -848,7 +901,70 @@ async def delete_review(review_id: str, user: TelegramUser = Depends(get_current
     sync_token = next_sync_token()
     await reviews_col.delete_one({"id": review_id})
     await review_reactions_col.delete_many({"reviewId": review_id})
+    await comments_col.delete_many({"reviewId": review_id})
     await record_review_sync_event("review_deleted", review_id, review.get("relId", ""), sync_token)
+    return {"status": "ok", "syncToken": sync_token}
+
+
+@app.post("/api/reviews/{review_id}/comments")
+async def add_comment(
+    review_id: str,
+    req: CommentReq,
+    user: TelegramUser = Depends(check_not_blocked),
+    _=Depends(rate_limiter),
+):
+    """
+    Добавить комментарий к рецензии.
+    - Автор определяется из Telegram (нельзя подделать).
+    - Несколько комментариев на рецензию разрешено.
+    - Заблокированные пользователи не могут писать.
+    """
+    review = await reviews_col.find_one({"id": review_id})
+    if not review:
+        raise HTTPException(404, "Review not found")
+
+    sync_token = next_sync_token()
+    data = {
+        "id": req.id,
+        "reviewId": review_id,
+        "relId": review.get("relId", ""),
+        "text": req.text,
+        "author": user.display_name,
+        "authorId": user.user_id,
+        "authorUsername": user.username,
+        "authorIsAdmin": user.is_admin,
+        "date": time.strftime("%d.%m.%Y"),
+        "timestamp": now_ms(),
+        "syncToken": sync_token,
+    }
+    try:
+        await comments_col.insert_one(data)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="Duplicate comment id")
+    await record_comment_sync_event("comment_added", req.id, review_id, data["relId"], sync_token)
+    return {"status": "ok", "comment": clean_doc(data), "syncToken": sync_token}
+
+
+@app.delete("/api/comments/{comment_id}")
+async def delete_comment(comment_id: str, user: TelegramUser = Depends(get_current_user)):
+    """
+    Удалить комментарий.
+    - Владелец может удалить свой.
+    - Создатель может удалить любой.
+    """
+    comment = await comments_col.find_one({"id": comment_id})
+    if not comment:
+        raise HTTPException(404, "Comment not found")
+
+    is_owner = comment.get("authorId") == user.user_id
+    if not is_owner and not user.is_admin:
+        raise HTTPException(403, "You can only delete your own comments")
+
+    sync_token = next_sync_token()
+    await comments_col.delete_one({"id": comment_id})
+    await record_comment_sync_event(
+        "comment_deleted", comment_id, comment.get("reviewId", ""), comment.get("relId", ""), sync_token
+    )
     return {"status": "ok", "syncToken": sync_token}
 
 
@@ -926,6 +1042,7 @@ async def delete_all_reviews_by_author(username: str, admin: TelegramUser = Depe
     result = await reviews_col.delete_many({"authorUsername": target})
     if review_ids:
         await review_reactions_col.delete_many({"reviewId": {"$in": review_ids}})
+        await comments_col.delete_many({"reviewId": {"$in": review_ids}})
     if doomed:
         await sync_events_col.insert_many([
             {

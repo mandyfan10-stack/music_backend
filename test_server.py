@@ -372,14 +372,16 @@ async def test_get_all_data_returns_sync_cursor_for_resume(clean_env):
         {"_id": "mongo-id", "id": "rel-1", "name": "Album", "syncToken": 100},
     ])
     server.reviews_col.find = lambda query=None: FakeCursor([])
+    server.comments_col.find = lambda query=None: FakeCursor([])
     server.releases_col.estimated_document_count = AsyncMock(return_value=1)
     server.reviews_col.estimated_document_count = AsyncMock(return_value=0)
+    server.comments_col.estimated_document_count = AsyncMock(return_value=0)
     server.sync_events_col.find = lambda query=None: FakeCursor([
         {"kind": "release_deleted", "releaseId": "rel-2", "syncToken": 150},
     ])
     server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([])
 
-    result = await server.get_all_data(FakeRequest(), releasesLimit=100, reviewsLimit=500)
+    result = await server.get_all_data(FakeRequest(), releasesLimit=100, reviewsLimit=500, commentsLimit=2000)
 
     assert result["syncCursor"] == 150
     assert result["releases"] == [{"id": "rel-1", "name": "Album", "syncToken": 100}]
@@ -904,12 +906,14 @@ async def test_get_all_data_includes_notifications_enabled(clean_env):
 
     server.releases_col.find = lambda query=None: FakeCursor([])
     server.reviews_col.find = lambda query=None: FakeCursor([])
+    server.comments_col.find = lambda query=None: FakeCursor([])
     server.releases_col.estimated_document_count = AsyncMock(return_value=0)
     server.reviews_col.estimated_document_count = AsyncMock(return_value=0)
+    server.comments_col.estimated_document_count = AsyncMock(return_value=0)
     server.sync_events_col.find = lambda query=None: FakeCursor([])
     server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([])
 
-    result = await server.get_all_data(FakeRequest(), releasesLimit=100, reviewsLimit=500)
+    result = await server.get_all_data(FakeRequest(), releasesLimit=100, reviewsLimit=500, commentsLimit=2000)
 
     assert result["currentUser"]["notificationsEnabled"] is True
 
@@ -971,12 +975,14 @@ async def test_get_all_data_marks_admin_review_authors(clean_env):
         {"id": "r1", "authorUsername": "admin", "text": "x"},
         {"id": "r2", "authorUsername": "bob", "text": "y"},
     ])
+    server.comments_col.find = lambda query=None: FakeCursor([])
     server.releases_col.estimated_document_count = AsyncMock(return_value=0)
     server.reviews_col.estimated_document_count = AsyncMock(return_value=2)
+    server.comments_col.estimated_document_count = AsyncMock(return_value=0)
     server.sync_events_col.find = lambda query=None: FakeCursor([])
     server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([{"_id": "r1", "count": 3}])
 
-    result = await server.get_all_data(FakeRequest(), releasesLimit=100, reviewsLimit=500)
+    result = await server.get_all_data(FakeRequest(), releasesLimit=100, reviewsLimit=500, commentsLimit=2000)
 
     by_id = {r["id"]: r for r in result["reviews"]}
     assert by_id["r1"]["authorIsAdmin"] is True
@@ -1001,12 +1007,14 @@ async def test_get_all_data_respects_limit_params(clean_env):
     server.reviews_col.find = lambda query=None: FakeCursor([
         {"id": "rv-1"}, {"id": "rv-2"},
     ])
+    server.comments_col.find = lambda query=None: FakeCursor([])
     server.releases_col.estimated_document_count = AsyncMock(return_value=3)
     server.reviews_col.estimated_document_count = AsyncMock(return_value=2)
+    server.comments_col.estimated_document_count = AsyncMock(return_value=0)
     server.sync_events_col.find = lambda query=None: FakeCursor([])
     server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([])
 
-    result = await server.get_all_data(FakeRequest(), releasesLimit=1, reviewsLimit=1)
+    result = await server.get_all_data(FakeRequest(), releasesLimit=1, reviewsLimit=1, commentsLimit=2000)
 
     # Выборка обрезана лимитом, но totals отражают полный размер каталога.
     assert len(result["releases"]) == 1
@@ -1120,6 +1128,7 @@ async def test_delete_review_records_review_sync_event(clean_env):
     server.reviews_col.find_one = AsyncMock(return_value={"id": "rv-1", "relId": "rel-1", "authorId": 1})
     server.reviews_col.delete_one = AsyncMock()
     server.review_reactions_col.delete_many = AsyncMock()
+    server.comments_col.delete_many = AsyncMock()
     server.sync_events_col.insert_one = AsyncMock()
     server.next_sync_token = lambda: 888
 
@@ -1235,3 +1244,162 @@ def test_is_safe_public_url_rejects_nonstandard_port(clean_env):
     importlib.reload(server)
 
     assert server.is_safe_public_url("http://example.com:8080/internal") is False
+
+
+@pytest.mark.asyncio
+async def test_add_comment_success(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.reviews_col.find_one = AsyncMock(return_value={"id": "rv-1", "relId": "rel-1"})
+    server.comments_col.insert_one = AsyncMock()
+    server.sync_events_col.insert_one = AsyncMock()
+    server.next_sync_token = lambda: 555
+
+    user = server.TelegramUser(user_id=7, username="fan", first_name="Fan", is_admin=False)
+    req = server.CommentReq(id="c-1", text="Отличная рецензия")
+    result = await server.add_comment("rv-1", req, user)
+
+    assert result["status"] == "ok"
+    assert result["syncToken"] == 555
+    assert result["comment"]["id"] == "c-1"
+    assert result["comment"]["reviewId"] == "rv-1"
+    assert result["comment"]["relId"] == "rel-1"
+    assert result["comment"]["authorId"] == 7
+    server.comments_col.insert_one.assert_awaited_once()
+    event = server.sync_events_col.insert_one.await_args.args[0]
+    assert event["kind"] == "comment_added"
+    assert event["commentId"] == "c-1"
+    assert event["reviewId"] == "rv-1"
+
+
+@pytest.mark.asyncio
+async def test_add_comment_missing_review(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.reviews_col.find_one = AsyncMock(return_value=None)
+    server.comments_col.insert_one = AsyncMock()
+
+    user = server.TelegramUser(user_id=7, username="fan", first_name="Fan", is_admin=False)
+    req = server.CommentReq(id="c-1", text="hi there")
+    with pytest.raises(HTTPException) as exc_info:
+        await server.add_comment("missing", req, user)
+
+    assert exc_info.value.status_code == 404
+    server.comments_col.insert_one.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delete_comment_by_owner(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.comments_col.find_one = AsyncMock(
+        return_value={"id": "c-1", "reviewId": "rv-1", "relId": "rel-1", "authorId": 7}
+    )
+    server.comments_col.delete_one = AsyncMock()
+    server.sync_events_col.insert_one = AsyncMock()
+    server.next_sync_token = lambda: 666
+
+    user = server.TelegramUser(user_id=7, username="fan", first_name="Fan", is_admin=False)
+    result = await server.delete_comment("c-1", user)
+
+    assert result == {"status": "ok", "syncToken": 666}
+    server.comments_col.delete_one.assert_awaited_once_with({"id": "c-1"})
+    event = server.sync_events_col.insert_one.await_args.args[0]
+    assert event["kind"] == "comment_deleted"
+    assert event["commentId"] == "c-1"
+
+
+@pytest.mark.asyncio
+async def test_delete_comment_forbidden_for_other_user(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.comments_col.find_one = AsyncMock(
+        return_value={"id": "c-1", "reviewId": "rv-1", "authorId": 2}
+    )
+    server.comments_col.delete_one = AsyncMock()
+
+    user = server.TelegramUser(user_id=1, username="x", first_name="X", is_admin=False)
+    with pytest.raises(HTTPException) as exc_info:
+        await server.delete_comment("c-1", user)
+
+    assert exc_info.value.status_code == 403
+    server.comments_col.delete_one.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_all_data_includes_comments(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    server.releases_col.find = lambda query=None: FakeCursor([])
+    server.reviews_col.find = lambda query=None: FakeCursor([])
+    server.comments_col.find = lambda query=None: FakeCursor([
+        {"_id": "m", "id": "c-1", "reviewId": "rv-1", "authorUsername": "admin", "text": "x"},
+    ])
+    server.releases_col.estimated_document_count = AsyncMock(return_value=0)
+    server.reviews_col.estimated_document_count = AsyncMock(return_value=0)
+    server.comments_col.estimated_document_count = AsyncMock(return_value=1)
+    server.sync_events_col.find = lambda query=None: FakeCursor([])
+    server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([])
+
+    result = await server.get_all_data(FakeRequest(), releasesLimit=100, reviewsLimit=500, commentsLimit=2000)
+
+    assert result["totalComments"] == 1
+    assert result["comments"][0]["id"] == "c-1"
+    # Роль автора комментария вычисляется на сервере.
+    assert result["comments"][0]["authorIsAdmin"] is True
+
+
+@pytest.mark.asyncio
+async def test_sync_releases_returns_comment_changes(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+
+    import server
+    importlib.reload(server)
+
+    events = [
+        {"kind": "comment_added", "commentId": "c-1", "reviewId": "rv-1", "relId": "rel-1", "syncToken": 401},
+        {"kind": "comment_deleted", "commentId": "c-2", "reviewId": "rv-1", "relId": "rel-1", "syncToken": 402},
+    ]
+
+    def fake_comment_find(query=None):
+        assert query == {"id": {"$in": ["c-1"]}}
+        return FakeCursor([{"_id": "m", "id": "c-1", "reviewId": "rv-1", "authorUsername": "bob"}])
+
+    server.sync_events_col.find = lambda query=None: FakeCursor(events)
+    server.comments_col.find = fake_comment_find
+    server.next_sync_token = lambda: 500
+
+    result = await server.sync_releases(since=400, limit=100)
+
+    assert result["cursor"] == 402
+    assert result["deletedCommentIds"] == ["c-2"]
+    assert result["comments"][0]["id"] == "c-1"
+    assert result["comments"][0]["authorIsAdmin"] is False
+    assert result["releases"] == []
