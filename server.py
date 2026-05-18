@@ -545,6 +545,17 @@ async def wait_for_release_sync_events(since: int, limit: int, wait_ms: int) -> 
 # ============================
 # PUSH-УВЕДОМЛЕНИЯ О РЕЛИЗАХ
 # ============================
+def release_deep_link(rel_id: str) -> str:
+    """Deep-link на Mini App, открывающий конкретный релиз (?startapp=<id>).
+
+    Пустая строка, если MINI_APP_URL не задан.
+    """
+    if not MINI_APP_URL:
+        return ""
+    sep = "&" if "?" in MINI_APP_URL else "?"
+    return f"{MINI_APP_URL}{sep}startapp={rel_id}"
+
+
 async def is_notifications_enabled(user_id: int) -> bool:
     """Подписан ли пользователь на push. Отсутствие записи = подписан (opt-out)."""
     doc = await notif_subscribers_col.find_one({"userId": user_id})
@@ -571,9 +582,8 @@ async def send_release_notifications(release: dict):
     text = f"🎵 Новый релиз в XXII SOUND\n\n{artist} — {name}"
 
     reply_markup = None
-    if MINI_APP_URL:
-        sep = "&" if "?" in MINI_APP_URL else "?"
-        deep_link = f"{MINI_APP_URL}{sep}startapp={release.get('id', '')}"
+    deep_link = release_deep_link(release.get("id", ""))
+    if deep_link:
         reply_markup = {
             "inline_keyboard": [[{"text": "Открыть в приложении", "url": deep_link}]]
         }
@@ -704,6 +714,7 @@ async def get_all_data(
         },
         "blockedUsers": blocked_list,
         "syncCursor": sync_cursor,
+        "miniAppUrl": MINI_APP_URL,
         "totalReleases": total_releases,
         "totalReviews": total_reviews,
         "totalComments": total_comments,
@@ -839,6 +850,82 @@ async def delete_release(rel_id: str, user: TelegramUser = Depends(require_admin
         await comments_col.delete_many({"reviewId": {"$in": review_ids}})
     await record_release_sync_event("release_deleted", rel_id, sync_token)
     return {"status": "ok", "syncToken": sync_token}
+
+
+@app.post("/api/releases/{rel_id}/share-message")
+async def share_release_message(
+    rel_id: str,
+    user: TelegramUser = Depends(get_current_user),
+    _=Depends(rate_limiter),
+):
+    """
+    Готовит нативное Telegram-сообщение о релизе для шеринга.
+
+    Через Bot API savePreparedInlineMessage сохраняется inline-результат с
+    обложкой и кнопкой, ведущей в Mini App на этот релиз; клиент затем вызывает
+    Telegram.WebApp.shareMessage с возвращённым id.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(503, "Sharing is not configured")
+    deep_link = release_deep_link(rel_id)
+    if not deep_link:
+        raise HTTPException(503, "Sharing is not configured")
+
+    release = await releases_col.find_one({"id": rel_id})
+    if not release:
+        raise HTTPException(404, "Release not found")
+
+    artist = (release.get("artist") or "").strip() or "Артист"
+    name = (release.get("name") or "").strip() or "Релиз"
+    img = release.get("img") or ""
+    caption = f"🎵 {artist} — {name}"
+    reply_markup = {"inline_keyboard": [[{"text": "Открыть релиз", "url": deep_link}]]}
+
+    if img.startswith(("http://", "https://")):
+        # Обложка по публичному URL — отдаём фото-результат.
+        result = {
+            "type": "photo",
+            "id": rel_id,
+            "photo_url": img,
+            "thumbnail_url": img,
+            "title": name,
+            "description": artist,
+            "caption": caption,
+            "reply_markup": reply_markup,
+        }
+    else:
+        # Нет публичной обложки (пусто или data:-URI) — текстовый результат.
+        result = {
+            "type": "article",
+            "id": rel_id,
+            "title": f"{artist} — {name}",
+            "description": "Поделиться релизом из XXII SOUND",
+            "input_message_content": {"message_text": caption},
+            "reply_markup": reply_markup,
+        }
+
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/savePreparedInlineMessage"
+    payload = {
+        "user_id": user.user_id,
+        "result": result,
+        "allow_user_chats": True,
+        "allow_group_chats": True,
+        "allow_channel_chats": True,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(api_url, json=payload)
+        data = resp.json()
+    except Exception as exc:
+        logger.warning("savePreparedInlineMessage failed: %s", exc)
+        raise HTTPException(502, "Failed to prepare share message")
+
+    prepared_id = data.get("result", {}).get("id") if data.get("ok") else None
+    if not prepared_id:
+        logger.warning("savePreparedInlineMessage rejected: %s", data)
+        raise HTTPException(502, "Failed to prepare share message")
+
+    return {"preparedMessageId": prepared_id}
 
 
 @app.post("/api/reviews")

@@ -1403,3 +1403,108 @@ async def test_sync_releases_returns_comment_changes(clean_env):
     assert result["comments"][0]["id"] == "c-1"
     assert result["comments"][0]["authorIsAdmin"] is False
     assert result["releases"] == []
+
+
+@pytest.mark.asyncio
+async def test_share_release_message_success(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "test-token"
+    os.environ["MINI_APP_URL"] = "https://t.me/xxiibot/app"
+
+    import server
+    importlib.reload(server)
+
+    server.releases_col.find_one = AsyncMock(return_value={
+        "id": "rel-1", "artist": "Artist", "name": "Album",
+        "img": "https://img.example/cover.jpg",
+    })
+
+    captured = {}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None):
+            captured["url"] = url
+            captured["payload"] = json
+            return SimpleNamespace(json=lambda: {"ok": True, "result": {"id": "prep-1"}})
+
+    server.httpx.AsyncClient = lambda *a, **k: FakeClient()
+
+    user = server.TelegramUser(user_id=42, username="fan", first_name="Fan", is_admin=False)
+    result = await server.share_release_message("rel-1", user)
+
+    assert result == {"preparedMessageId": "prep-1"}
+    assert "savePreparedInlineMessage" in captured["url"]
+    assert captured["payload"]["user_id"] == 42
+    assert captured["payload"]["result"]["type"] == "photo"
+    button = captured["payload"]["result"]["reply_markup"]["inline_keyboard"][0][0]
+    assert button["url"] == "https://t.me/xxiibot/app?startapp=rel-1"
+
+
+@pytest.mark.asyncio
+async def test_share_release_message_missing_release(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "test-token"
+    os.environ["MINI_APP_URL"] = "https://t.me/xxiibot/app"
+
+    import server
+    importlib.reload(server)
+
+    server.releases_col.find_one = AsyncMock(return_value=None)
+
+    user = server.TelegramUser(user_id=42, username="fan", first_name="Fan", is_admin=False)
+    with pytest.raises(HTTPException) as exc_info:
+        await server.share_release_message("missing", user)
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_share_release_message_unconfigured(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+    if "TELEGRAM_BOT_TOKEN" in os.environ:
+        del os.environ["TELEGRAM_BOT_TOKEN"]
+
+    import server
+    importlib.reload(server)
+
+    user = server.TelegramUser(user_id=42, username="fan", first_name="Fan", is_admin=False)
+    with pytest.raises(HTTPException) as exc_info:
+        await server.share_release_message("rel-1", user)
+
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_get_all_data_exposes_mini_app_url(clean_env):
+    os.environ["ENV"] = "test"
+    os.environ["MONGO_URL"] = "mongodb://localhost"
+    os.environ["ADMIN_USERNAMES"] = "admin"
+    os.environ["MINI_APP_URL"] = "https://t.me/xxiibot/app"
+
+    import server
+    importlib.reload(server)
+
+    server.releases_col.find = lambda query=None: FakeCursor([])
+    server.reviews_col.find = lambda query=None: FakeCursor([])
+    server.comments_col.find = lambda query=None: FakeCursor([])
+    server.releases_col.estimated_document_count = AsyncMock(return_value=0)
+    server.reviews_col.estimated_document_count = AsyncMock(return_value=0)
+    server.comments_col.estimated_document_count = AsyncMock(return_value=0)
+    server.sync_events_col.find = lambda query=None: FakeCursor([])
+    server.review_reactions_col.aggregate = lambda pipeline: FakeCursor([])
+
+    result = await server.get_all_data(FakeRequest(), releasesLimit=100, reviewsLimit=500, commentsLimit=2000)
+
+    assert result["miniAppUrl"] == "https://t.me/xxiibot/app"
