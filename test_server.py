@@ -177,7 +177,7 @@ async def test_duplicate_review(clean_env):
     rev = server.Review(id="1", relId="1", text="a"*30, rating=5, baseRating=5, criteria={}, objectiveRating=5.0)
 
     with pytest.raises(HTTPException) as exc_info:
-        await server.add_review(rev, user)
+        await server.add_review(rev, user=user)
 
     assert exc_info.value.status_code == 409
 
@@ -437,7 +437,7 @@ async def test_toggle_like_requires_existing_release(clean_env):
     req = server.LikeReq(releaseId="missing", isLike=True)
 
     with pytest.raises(HTTPException) as exc_info:
-        await server.toggle_like(req, user)
+        await server.toggle_like(req, user=user)
 
     assert exc_info.value.status_code == 404
     server.likes_col.update_one.assert_not_called()
@@ -761,7 +761,7 @@ async def test_add_review_ignores_client_rating(clean_env):
         criteria={k: 5 for k in server.CRITERIA_KEYS}, objectiveRating=1.0,
     )
 
-    await server.add_review(rev, user)
+    await server.add_review(rev, user=user)
 
     stored = server.reviews_col.insert_one.await_args.args[0]
     assert stored["objectiveRating"] == 5.0
@@ -1038,7 +1038,7 @@ async def test_react_to_review_adds_reaction(clean_env):
     server.review_reactions_col.count_documents = AsyncMock(return_value=4)
 
     user = server.TelegramUser(user_id=7, username="fan", first_name="Fan", is_admin=False)
-    result = await server.react_to_review("rv-1", server.ReactReq(reacted=True), user)
+    result = await server.react_to_review("rv-1", server.ReactReq(reacted=True), user=user)
 
     assert result == {"status": "ok", "reactionCount": 4}
     server.review_reactions_col.update_one.assert_awaited_once()
@@ -1060,7 +1060,7 @@ async def test_react_to_review_removes_reaction(clean_env):
     server.review_reactions_col.count_documents = AsyncMock(return_value=0)
 
     user = server.TelegramUser(user_id=7, username="fan", first_name="Fan", is_admin=False)
-    result = await server.react_to_review("rv-1", server.ReactReq(reacted=False), user)
+    result = await server.react_to_review("rv-1", server.ReactReq(reacted=False), user=user)
 
     assert result == {"status": "ok", "reactionCount": 0}
     server.review_reactions_col.delete_one.assert_awaited_once()
@@ -1081,7 +1081,7 @@ async def test_react_to_review_missing_review(clean_env):
 
     user = server.TelegramUser(user_id=7, username="fan", first_name="Fan", is_admin=False)
     with pytest.raises(HTTPException) as exc_info:
-        await server.react_to_review("missing", server.ReactReq(reacted=True), user)
+        await server.react_to_review("missing", server.ReactReq(reacted=True), user=user)
 
     assert exc_info.value.status_code == 404
     server.review_reactions_col.count_documents.assert_not_called()
@@ -1106,7 +1106,7 @@ async def test_add_review_records_review_sync_event(clean_env):
     rev = server.Review(id="rv-1", relId="rel-1", text="a" * 30, baseRating=5,
                         criteria={k: 5 for k in server.CRITERIA_KEYS})
 
-    result = await server.add_review(rev, user)
+    result = await server.add_review(rev, user=user)
 
     assert result["syncToken"] == 777
     event = server.sync_events_col.insert_one.await_args.args[0]
@@ -1262,7 +1262,7 @@ async def test_add_comment_success(clean_env):
 
     user = server.TelegramUser(user_id=7, username="fan", first_name="Fan", is_admin=False)
     req = server.CommentReq(id="c-1", text="Отличная рецензия")
-    result = await server.add_comment("rv-1", req, user)
+    result = await server.add_comment("rv-1", req, user=user)
 
     assert result["status"] == "ok"
     assert result["syncToken"] == 555
@@ -1292,7 +1292,7 @@ async def test_add_comment_missing_review(clean_env):
     user = server.TelegramUser(user_id=7, username="fan", first_name="Fan", is_admin=False)
     req = server.CommentReq(id="c-1", text="hi there")
     with pytest.raises(HTTPException) as exc_info:
-        await server.add_comment("missing", req, user)
+        await server.add_comment("missing", req, user=user)
 
     assert exc_info.value.status_code == 404
     server.comments_col.insert_one.assert_not_called()

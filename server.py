@@ -103,7 +103,12 @@ def validate_settings():
 
 validate_settings()
 
-client_db = AsyncIOMotorClient(MONGO_URL)
+client_db = AsyncIOMotorClient(
+    MONGO_URL,
+    maxPoolSize=int(os.getenv("MONGO_MAX_POOL_SIZE", "50")),
+    minPoolSize=int(os.getenv("MONGO_MIN_POOL_SIZE", "0")),
+    serverSelectionTimeoutMS=int(os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "5000")),
+)
 db = client_db["raper_xxii_database"]
 
 releases_col = db["releases"]
@@ -637,15 +642,19 @@ async def get_all_data(
         releases_task, reviews_task, comments_task
     )
 
+    # Реакции считаем только по возвращаемым рецензиям, а не по всей коллекции.
+    review_ids = [r.get("id") for r in all_reviews if r.get("id")]
+
     # Counts, reaction tallies and the sync cursor are independent — fetch them
     # in parallel instead of sequential round-trips.
     total_releases, total_reviews, total_comments, reaction_agg, latest_events = await asyncio.gather(
         releases_col.estimated_document_count(),
         reviews_col.estimated_document_count(),
         comments_col.estimated_document_count(),
-        review_reactions_col.aggregate(
-            [{"$group": {"_id": "$reviewId", "count": {"$sum": 1}}}]
-        ).to_list(length=10000),
+        review_reactions_col.aggregate([
+            {"$match": {"reviewId": {"$in": review_ids}}},
+            {"$group": {"_id": "$reviewId", "count": {"$sum": 1}}},
+        ]).to_list(length=(len(review_ids) or 1)),
         sync_events_col.find().sort("syncToken", -1).to_list(length=1),
     )
     reaction_counts = {row["_id"]: row["count"] for row in reaction_agg}
@@ -677,18 +686,20 @@ async def get_all_data(
         display_name = tg_user.display_name
         username = tg_user.username
         is_admin = tg_user.is_admin
-        notifications_enabled = await is_notifications_enabled(tg_user.user_id)
 
-        my_reaction_docs = await review_reactions_col.find({"userId": tg_user.user_id}).to_list(length=5000)
+        # Запросы пользователя независимы — выполняем параллельно одним gather.
+        wants_likes = bool(tg_user.username)
+        notifications_enabled, my_reaction_docs, likes, blocked_doc = await asyncio.gather(
+            is_notifications_enabled(tg_user.user_id),
+            review_reactions_col.find({"userId": tg_user.user_id}).to_list(length=5000),
+            (likes_col.find({"$or": [{"userId": tg_user.user_id}, {"username": tg_user.username}]}).to_list(length=1000)
+             if wants_likes else asyncio.sleep(0, result=[])),
+            (blocked_col.find_one({"username": tg_user.username})
+             if wants_likes else asyncio.sleep(0, result=None)),
+        )
         my_reactions = [doc["reviewId"] for doc in my_reaction_docs]
-
-        if tg_user.username:
-            likes = await likes_col.find({
-                "$or": [{"userId": tg_user.user_id}, {"username": tg_user.username}]
-            }).to_list(length=1000)
+        if wants_likes:
             user_likes = [l["releaseId"] for l in likes]
-            # Проверка блокировки
-            blocked_doc = await blocked_col.find_one({"username": tg_user.username})
             is_blocked = bool(blocked_doc and blocked_doc.get("blocked"))
 
     # Список заблокированных (только для админов)
@@ -936,7 +947,7 @@ async def share_release_message(
 
 
 @app.post("/api/reviews")
-async def add_review(rev: Review, user: TelegramUser = Depends(check_not_blocked), _=Depends(rate_limiter)):
+async def add_review(rev: Review, _=Depends(rate_limiter), user: TelegramUser = Depends(check_not_blocked)):
     """
     Добавить рецензию.
     - Автор определяется из Telegram (нельзя подделать).
@@ -1004,8 +1015,8 @@ async def delete_review(review_id: str, user: TelegramUser = Depends(get_current
 async def add_comment(
     review_id: str,
     req: CommentReq,
-    user: TelegramUser = Depends(check_not_blocked),
     _=Depends(rate_limiter),
+    user: TelegramUser = Depends(check_not_blocked),
 ):
     """
     Добавить комментарий к рецензии.
@@ -1063,7 +1074,7 @@ async def delete_comment(comment_id: str, user: TelegramUser = Depends(get_curre
 
 
 @app.post("/api/likes")
-async def toggle_like(req: LikeReq, user: TelegramUser = Depends(check_not_blocked), _=Depends(rate_limiter)):
+async def toggle_like(req: LikeReq, _=Depends(rate_limiter), user: TelegramUser = Depends(check_not_blocked)):
     """Лайк/анлайк — только авторизованные, не заблокированные."""
     release = await releases_col.find_one({"id": req.releaseId})
     if not release:
@@ -1088,8 +1099,8 @@ async def toggle_like(req: LikeReq, user: TelegramUser = Depends(check_not_block
 async def react_to_review(
     review_id: str,
     req: ReactReq,
-    user: TelegramUser = Depends(check_not_blocked),
     _=Depends(rate_limiter),
+    user: TelegramUser = Depends(check_not_blocked),
 ):
     """Реакция «полезно» на рецензию — toggle, только авторизованные и не заблокированные."""
     review = await reviews_col.find_one({"id": review_id})
@@ -1254,7 +1265,7 @@ async def get_metadata_from_page(url: str):
         async with httpx.AsyncClient(follow_redirects=False, headers=headers, timeout=10.0) as h_client:
             current_url = url
             for _ in range(5):
-                if not is_safe_public_url(current_url):
+                if not await asyncio.to_thread(is_safe_public_url, current_url):
                     return "", "", ""
                 res = await h_client.get(current_url)
                 if res.is_redirect:
@@ -1499,7 +1510,8 @@ def normalize_genre(raw: str) -> str:
 @app.post("/api/parse_link")
 async def parse_link(req: LinkRequest, user: TelegramUser = Depends(require_admin), _=Depends(rate_limiter)):
     """Распознавание ссылки — только Создатель. Возвращает artist, name, img, genre."""
-    if not is_safe_public_url(req.link):
+    # SSRF-проверка делает блокирующий DNS-резолв — уводим её в поток.
+    if not await asyncio.to_thread(is_safe_public_url, req.link):
         raise HTTPException(400, "Unsafe or unsupported URL")
 
     yandex_result = await get_yandex_music_release(req.link)
