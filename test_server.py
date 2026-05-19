@@ -268,7 +268,7 @@ async def test_sync_releases_initial_snapshot(clean_env):
 
     result = await server.sync_releases(since=0, limit=100)
 
-    assert result["cursor"] == 20
+    assert result["cursor"] == "20"
     assert result["serverTime"] == 30
     assert result["deletedReleaseIds"] == []
     assert result["releases"][0] == {"id": "rel-1", "name": "Album", "syncToken": 10}
@@ -298,7 +298,7 @@ async def test_sync_releases_incremental_changes(clean_env):
 
     result = await server.sync_releases(since=100, limit=100)
 
-    assert result["cursor"] == 102
+    assert result["cursor"] == "102"
     assert result["serverTime"] == 200
     assert result["deletedReleaseIds"] == ["rel-2"]
     assert result["releases"] == [{"id": "rel-1", "name": "Album", "syncToken": 101}]
@@ -335,7 +335,7 @@ async def test_sync_releases_long_poll_waits_for_new_events(clean_env):
     result = await server.sync_releases(since=100, limit=100, waitMs=100)
 
     assert calls["count"] == 2
-    assert result["cursor"] == 101
+    assert result["cursor"] == "101"
     assert result["releases"] == [{"id": "rel-1", "name": "Album", "syncToken": 101}]
 
 
@@ -354,7 +354,7 @@ async def test_sync_releases_long_poll_times_out_empty(clean_env):
 
     result = await server.sync_releases(since=100, limit=100, waitMs=1)
 
-    assert result["cursor"] == 100
+    assert result["cursor"] == "100"
     assert result["releases"] == []
     assert result["deletedReleaseIds"] == []
 
@@ -383,7 +383,7 @@ async def test_get_all_data_returns_sync_cursor_for_resume(clean_env):
 
     result = await server.get_all_data(FakeRequest(), releasesLimit=100, reviewsLimit=500, commentsLimit=2000)
 
-    assert result["syncCursor"] == 150
+    assert result["syncCursor"] == "150"
     assert result["releases"] == [{"id": "rel-1", "name": "Album", "syncToken": 100}]
     assert result["totalReleases"] == 1
     assert result["totalReviews"] == 0
@@ -416,7 +416,7 @@ async def test_sync_releases_catches_up_after_polling_pause(clean_env):
 
     result = await server.sync_releases(since=150, limit=100)
 
-    assert result["cursor"] == 152
+    assert result["cursor"] == "152"
     assert [release["id"] for release in result["releases"]] == ["rel-2", "rel-3"]
     assert result["deletedReleaseIds"] == []
 
@@ -1166,7 +1166,7 @@ async def test_sync_releases_returns_review_changes(clean_env):
 
     result = await server.sync_releases(since=300, limit=100)
 
-    assert result["cursor"] == 302
+    assert result["cursor"] == "302"
     assert result["deletedReviewIds"] == ["rv-2"]
     assert result["reviews"][0]["id"] == "rv-1"
     assert result["reviews"][0]["authorIsAdmin"] is True
@@ -1398,7 +1398,7 @@ async def test_sync_releases_returns_comment_changes(clean_env):
 
     result = await server.sync_releases(since=400, limit=100)
 
-    assert result["cursor"] == 402
+    assert result["cursor"] == "402"
     assert result["deletedCommentIds"] == ["c-2"]
     assert result["comments"][0]["id"] == "c-1"
     assert result["comments"][0]["authorIsAdmin"] is False

@@ -713,7 +713,9 @@ async def get_all_data(
             "notificationsEnabled": notifications_enabled,
         },
         "blockedUsers": blocked_list,
-        "syncCursor": sync_cursor,
+        # Курсор синхронизации — строкой: значение time_ns превышает
+        # Number.MAX_SAFE_INTEGER, и числом JS терял бы точность.
+        "syncCursor": str(sync_cursor),
         "miniAppUrl": MINI_APP_URL,
         "totalReleases": total_releases,
         "totalReviews": total_reviews,
@@ -723,22 +725,27 @@ async def get_all_data(
 
 @app.get("/api/sync/releases")
 async def sync_releases(
-    since: int = Query(0, ge=0),
+    since: str = Query("0"),
     limit: int = Query(100, ge=1, le=500),
     waitMs: int = 0,
 ):
     """
     Fast incremental release sync.
     First call may use since=0; later calls should pass the returned cursor.
+
+    `since`/`cursor` — строки: токены (time_ns) превышают
+    Number.MAX_SAFE_INTEGER, поэтому числом JS терял бы точность.
     """
-    if since == 0:
+    since_token = int(since) if str(since).isdigit() else 0
+
+    if since_token == 0:
         releases = await releases_col.find().sort("syncToken", -1).to_list(length=limit)
         for release in releases:
             clean_doc(release)
 
         cursor = max((get_release_sync_token(release) for release in releases), default=0)
         return {
-            "cursor": cursor,
+            "cursor": str(cursor),
             "serverTime": next_sync_token(),
             "releases": releases,
             "deletedReleaseIds": [],
@@ -749,7 +756,7 @@ async def sync_releases(
             "hasMore": False,
         }
 
-    events = await wait_for_release_sync_events(since, limit, waitMs)
+    events = await wait_for_release_sync_events(since_token, limit, waitMs)
 
     changed_release_ids = []
     deleted_release_ids = []
@@ -802,9 +809,9 @@ async def sync_releases(
             clean_doc(comment)
             comment["authorIsAdmin"] = normalize_username(comment.get("authorUsername", "")) in ADMIN_USERNAMES
 
-    cursor = max((int(event.get("syncToken") or since) for event in events), default=since)
+    cursor = max((int(event.get("syncToken") or since_token) for event in events), default=since_token)
     return {
-        "cursor": cursor,
+        "cursor": str(cursor),
         "serverTime": next_sync_token(),
         "releases": releases,
         "deletedReleaseIds": list(dict.fromkeys(deleted_release_ids)),
