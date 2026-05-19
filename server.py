@@ -977,7 +977,7 @@ async def add_review(rev: Review, _=Depends(rate_limiter), user: TelegramUser = 
     data["authorUsername"] = user.username
     data["authorIsAdmin"] = user.is_admin
     data["date"] = time.strftime("%d.%m.%Y")
-    data["timestamp"] = time.time() * 1000
+    data["timestamp"] = now_ms()
     sync_token = next_sync_token()
     data["syncToken"] = sync_token
     try:
@@ -1269,6 +1269,9 @@ async def get_metadata_from_page(url: str):
                     return "", "", ""
                 res = await h_client.get(current_url)
                 if res.is_redirect:
+                    # 3xx без заголовка Location — next_request будет None.
+                    if res.next_request is None:
+                        return "", "", ""
                     current_url = str(res.next_request.url)
                     continue
                 res.raise_for_status()
